@@ -1,0 +1,11 @@
+OpenCode Subagents-
+    Build -> to build with all tools enabled, file operations, system commands
+    plan -> to plan the action, no editing access
+    general -> for research and complex purposes, multi step tasks
+    explore -> to read only codebases, search code by keywords without modifying them
+    scout -> read only for external docs
+
+OpenCode Primary-
+    compection -> compact long context into a smaller memory
+    title -> generates session titles
+    summary -> creates session summaries
