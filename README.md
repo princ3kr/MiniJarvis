@@ -1,92 +1,95 @@
-# searchFiles agent + planner + ReAct
+# jarvis
 
-A read-only agent over your filesystem, with a planner, a verifier, and a ReAct loop.
-Everything lives in `glinerTest.ipynb`.
+A read-only file agent with a planner, a verifier, and a policy-enforced executor.
+Every command runs inside a jail; nothing that reaches a model has been through one
+unguarded.
+
+This was a 4,600-line notebook. It is now an importable package with tests, because
+the safety properties are the product and a safety property that lives only inside a
+notebook is one nobody runs.
 
 ## Run it
 
 ```bash
-./run.sh          # check env, then open Jupyter Lab
-./run.sh check    # env check only
-./run.sh plan     # headless plan-execute demo (no browser)
-./run.sh react    # headless ReAct demo
+.venv/bin/python -m jarvis "where is safe_resolve defined?"
 ```
 
-Then in Jupyter: **pick the `Agent (venv: dspy)` kernel** → **Restart Kernel → Run All**.
-
-## In a notebook cell
+The venv matters: `dspy` and `pydantic` are not in system python.
 
 ```python
-run_task("how many images are in my Downloads folder?")           # auto-routed
-run_task("where is safe_resolve defined?", strategy="react")      # adaptive loop
-run_task("find X then count Y", strategy="plan")                 # plan + verify
+from jarvis.context import new_task
+from jarvis.engine import run_task
 
-show_path_log()      # every attempt: what ran, what failed, why
-show_plan(plan)      # step-by-step status
-ask("show me glinerTest.ipynb")   # skip the planner, one agent call
+ctx = new_task("how many python files are under src/")
+run_task(ctx.query, ctx=ctx, strategy="direct", use_llm_verify=False)
+print(ctx.summary())
 ```
 
-## The trap that will bite you
-
-**dspy and pydantic are only in `.venv`, not system python.** Run everything with
-`./run.sh` or `.venv/bin/python`, and use the `Agent (venv: dspy)` kernel. Under system
-python the planner and ReAct silently fall back to deterministic behaviour — nothing
-crashes, you just get a different (worse) agent.
-
-`./run.sh check` tells you which mode you're in.
-
-## Environment
-
-| | |
-|---|---|
-| venv | `.venv` — dspy 3.4.0, pydantic 2.13.5 |
-| model | `qwen/qwen3.8-27b` via Groq (OpenAI-compatible) |
-| jail | `/home/princ3kr` — nothing outside it is readable |
-
-**Groq's daily token limit is per-model.** `gpt-oss-120b` and `qwen/qwen3.8-27b` have
-separate buckets, so one being exhausted doesn't lock out the other. `run.sh` keeps
-`DSPY_MODEL` and `LLM_MODEL` aligned — if they differ, the plan executes fine and then the
-final answer hits a 429.
-
-## Tests
+## Verify it
 
 ```bash
-.venv/bin/python test_planner.py       # 32 tests
-.venv/bin/python test_searchfiles.py   # 28 tests
+.venv/bin/python -m pytest tests/ -q     # 110 tests, no network
+.venv/bin/python -m jarvis.probe         # zero PERMISSIVE is the bar
 ```
 
-They exec the notebook's own cells, so they test what's actually in the file.
+The probe is the interesting one. It feeds the executor the notebook's own list of
+attacks — untrusted binaries, paths outside the scope, recursive walks into
+deny-listed directories, `env` wrapping an interpreter, an output flood — and
+reports anything the policy allowed that it should not have. It exits non-zero on a
+single finding. Baseline was 20; it is now 0.
 
-## What's here
+## The shape
 
-| piece | what it does |
-|---|---|
-| `searchFiles` | 4 tools: `find_files` (files + folders, 4-tier similarity), `search_content`, `read_file` (capped), `survey_files` (counts) |
-| planner | `dspy.Predict` + Pydantic `Plan`/`Step`, DAG-validated |
-| verifier | structural checks → LLM rubric → `pass` / `fail` / `unsure` |
-| orchestrator | plain Python: ready-queue, repeat rejection, replan cap |
-| ReAct | `dspy.ReAct` loop over the same 4 jailed tools, `max_iters=6` |
+```
+engine ──── router → planner → agents → verifier        the loop
+   │
+   └── gateway → policy → runner                        every command
+          │
+access ─┴── the jail. the only thing allowed to say yes to a path
+```
 
-Result contract, uniform across agents:
+`jarvis/CONTRACT.md` is the interface contract. Read it before changing anything.
+`ARCHITECTURE.md` explains why the layering is the way it is, what is deliberately
+broken, and which findings have been closed.
 
-| field | meaning |
-|---|---|
-| `status` | `ok` / `near_miss` / `not_found` |
-| `route` | `aggregate` / `locate` |
-| `summary` | one line, no dumps |
-| `evidence` | citable `path:line` excerpts |
-| `confidence` | explicit, so the LLM hedges instead of inventing |
+Three rules the codebase actually enforces:
 
-## Known gaps
+1. **One jail.** `AccessPolicy.resolve` is the only way to turn a path into a real
+   path. Tools, command operands, postconditions, and the index all go through it.
+2. **One process spawner.** `runner.run_process` is the only place a child starts.
+   Scrubbed env, process-group kill, rlimits, bounded output.
+3. **No module-level mutable state.** No counters, no caches, no `gateway_reset()`.
+   Everything mutable is a `TaskContext` field, so two tasks in one process are
+   independent.
 
-- **`webSearch` is unimplemented.** Steps targeting it fail visibly rather than pretend.
-  ReAct is where it would matter most — the check that a module is missing locally
-  belongs in the tool wrapper, not the prompt.
-- **ReAct answers are unverified.** Planned steps go through `verify_step`; a ReAct run
-  doesn't. Reusing `rubric_verify` on the trajectory is the obvious fix.
-- **Your API key is in plaintext in the notebook.** Prefer
-  `export GROQ_API_KEY="gsk_..."` and blank `_INLINE_KEY`.
-- **The jail spans your whole home**, so `~/Downloads/AMRv2_api_key.txt` is currently
-  readable by the agent. There's no `SENSITIVE_NAMES` deny-list yet.
-- **Rust `target/` is not pruned** — 4857 of the ~5130 visible files are build artifacts,
-  which skews every count.
+## Configuration
+
+`.env`, untracked because it holds live credentials:
+
+```
+LLM_BASE_URL = ...
+LLM_MODEL    = ...
+DSPY_MODEL   = ...
+```
+
+`jarvis/config.py` parses it. Environment variables win, then explicit overrides.
+
+The executor is off by default and stays off until deliberately raised:
+
+```
+executor_enabled_tier = 0     # 0 = read-only commands only
+executor_dry_run     = true   # nothing that writes or executes, even at tier 1+
+```
+
+Raising either is a decision to make after reading the probe output.
+
+## What is frozen
+
+Snapshot/undo, tier 1 and 2, approvals, and interpreters are implemented and
+present but gated off. `manifests.discovery` is `max_tier=0` with no `run_command`
+tool, so command execution is unreachable from a normal task.
+
+## Known issues
+
+Preserved deliberately, each marked `# KNOWN BUG (removal scheduled)` with the phase
+that removes it. The table in `ARCHITECTURE.md` lists all of them with locations.

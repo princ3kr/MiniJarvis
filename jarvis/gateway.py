@@ -52,11 +52,13 @@ from typing import Any, Literal
 
 from .access import AccessDenied, AccessPolicy
 from .config import Settings, load_settings
-from .context import TaskContext
+from .context import TaskContext, new_task
+from .manifests import build_manifests
 from .policy import CommandSpec, PolicyVerdict, Tier, classify
 from .runner import ProcessResult, argv_preview, run_process
 
-__all__ = ["Gateway", "CommandResult", "CheckResult", "authorize", "execute"]
+__all__ = ["Gateway", "CommandResult", "CheckResult", "authorize", "execute",
+           "main"]
 
 # The highest tier permitted to reach the runner. Deliberately duplicated here as a
 # default only: `Settings.executor_enabled_tier` is what actually applies, and it is
@@ -335,6 +337,94 @@ def _changed_paths(before: dict[str, tuple[int, float]]) -> list[str]:
     return sorted(changed)[:20]
 
 
+def main(argv: list[str] | None = None) -> int:
+    """CLI: ask the policy about one command. `python -m jarvis.gateway <cmd...>`
+
+    The point is that this is a way to ASK the policy a question, not a way around
+    it. `--tier` classifies and exits; without it the command runs, but only through
+    the same `authorize` path an agent would take -- including the enabled-tier
+    ceiling, the dry-run default, and per-argv approval.
+    """
+    import argparse
+    import shlex
+    import shutil
+
+    ap = argparse.ArgumentParser(prog="python -m jarvis.gateway",
+                                 description="classify or run one command under policy")
+    ap.add_argument("--tier", action="store_true", help="classify only, do not run")
+    ap.add_argument("--approve", action="store_true", help="grant this exact argv")
+    ap.add_argument("--agent", default="executor")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="force dry-run even when the setting allows execution")
+    ap.add_argument("command", nargs=argparse.REMAINDER)
+    args = ap.parse_args(argv)
+
+    cmd = args.command
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        ap.error("no command given")
+
+    # Split when the caller passed a single string, so both `-- ls -la` and
+    # `-- "ls -la"` work.
+    if len(cmd) == 1 and " " in cmd[0]:
+        cmd = shlex.split(cmd[0])
+
+    # A bare `ls` is refused, correctly, because argv[0] must be absolute. That is
+    # the right refusal for a model but the wrong ergonomics for a human at a
+    # terminal, so the CLI resolves bare names itself. It uses `which`, which
+    # searches PATH -- including user-writable directories. Policy then re-checks
+    # that the result is in a trusted directory, so resolving through PATH here
+    # cannot authorise anything it would otherwise refuse; it only saves the user
+    # from having to type /usr/bin/ls.
+    head = cmd[0]
+    if not head.startswith("/") and not head.startswith("."):
+        found = shutil.which(head)
+        if found:
+            cmd = [found, *cmd[1:]]
+        else:
+            print(f"no such executable: {head}")
+            return 3
+
+    settings = load_settings()
+    try:
+        spec = CommandSpec(argv=[str(a) for a in cmd], why="cli")
+    except Exception as e:
+        print(f"rejected by schema: {str(e).splitlines()[-1]}")
+        return 3
+
+    ctx = new_task("cli", settings=settings)
+    manifest = build_manifests(tuple(str(r) for r in settings.read_roots),
+                               str(settings.write_root))[args.agent]
+
+    if args.tier:
+        policy = AccessPolicy.from_settings(settings, cwd=ctx.root)
+        try:
+            v = classify(spec, manifest, access=policy)
+        except Exception as e:
+            print(f"classifier error: {type(e).__name__}")
+            return 3
+        print(f"tier {int(v.tier)}  {v.binary or argv_preview(cmd)}")
+        for r in v.reasons:
+            print(f"        {r}")
+        return 0 if not v.denied else 1
+
+    r = execute(spec, manifest, ctx=ctx, approve=args.approve,
+                dry_run=True if args.dry_run else None)
+    print(f"{r.status}  tier {r.tier}  {argv_preview(cmd)}")
+    if r.reason:
+        print(f"  reason: {r.reason}")
+    for c in r.policy_reasons:
+        print(f"  policy: {c}")
+    if r.stdout_tail:
+        print(r.stdout_tail[-4000:])
+    if r.stderr_tail:
+        print(f"[stderr] {r.stderr_tail[-2000:]}")
+    # denied is a refusal (3), declined is a policy decision awaiting a human (2),
+    # everything else is an outcome the caller asked for.
+    return {"denied": 3, "declined": 2, "error": 1}.get(r.status, 0)
+
+
 class Gateway:
     """Object wrapper, for callers that want the choke point as a dependency.
 
@@ -360,3 +450,7 @@ class Gateway:
 
     def run(self, spec: CommandSpec, manifest, *, ctx: TaskContext) -> CommandResult:
         return self.execute(spec, manifest, ctx=ctx)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
