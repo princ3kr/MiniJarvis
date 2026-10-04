@@ -59,6 +59,8 @@ from .tools import grep as grep_tool
 from .tools import read as read_tool
 from .tools import survey as survey_tool
 from .tools.observation import Observation
+from .scratch import (Scratchpad, StuckDetector, environment_facts,
+                     page_observation)
 from .toolspec import TOOLS, from_text, from_tool_calls
 from .trace import Verdict
 
@@ -110,11 +112,12 @@ ACTION_PROMPT = """{system}
 
 GOAL: {goal}
 
+SO FAR
 {trajectory}
 
 Turn {n} of {max_turns}. Remaining: {budget}.
 
-Reply with ONE JSON object:"""
+Reply with ONE JSON object: run a command, or finish."""
 
 
 _NUM = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s*([KMGTP]i?B?|bytes?)?", re.I)
@@ -199,7 +202,7 @@ class Step:
 @dataclass
 class ReactResult:
     answer: str | None
-    status: str                    # answered | inconclusive | budget | refused
+    status: str                    # answered | inconclusive | budget | stuck | refused
     steps: list[Step] = field(default_factory=list)
     answer_source: str = ""        # which action produced the final answer
     # Whether the evidence actually supports the answer. False means the finish was
@@ -249,6 +252,15 @@ class ReactLoop:
         # filesystem into the next one's context, which is both a privacy bug and a
         # correctness one.
         self._wire: list[dict[str, Any]] = []
+        # Environment facts, a scratchpad of what is established, and a stuck
+        # detector. All per-loop. The first version of this loop had none of them and
+        # every failure was the same shape: the model guessed whether a shell existed,
+        # guessed whether the policy added prune flags, and retried refusals, because
+        # nothing in its context said otherwise.
+        self.scratch = Scratchpad()
+        self.stuck = StuckDetector(threshold=3)
+        self._facts = environment_facts(
+            read_roots=tuple(ctx.settings.read_roots))
 
     # ------------------------------------------------------------------ dispatch
     def _dispatch(self, action: str, args: dict[str, Any]) -> Observation:
@@ -292,13 +304,23 @@ class ReactLoop:
         supplies no tools ("HTTP 400: Tool choice is none, but model called a tool"),
         and no payload flag works around it.
         """
-        msgs = [{"role": "system", "content": ACTION_PROMPT.format(
-            system=SYSTEM, goal=goal, trajectory=trajectory or "(nothing yet)",
-            n=n, max_turns=self.max_turns, budget=self._budget_line())}]
+        msgs = [{"role": "system", "content": SYSTEM},
+                {"role": "user", "content": ACTION_PROMPT.format(
+                    system=self._facts,
+                    goal=goal,
+                    trajectory="\n\n".join(
+                        filter(None, [trajectory, self.scratch.render()])),
+                    n=n, max_turns=self.max_turns, budget=self._budget_line())}]
         # The conversation is built incrementally: each observation is appended as a
         # real `tool` message so the model can see WHAT CAME BACK, not a transcript
         # flattened into prose. That is the difference between a model that can read a
         # `wc -l` result and one that is told "the command returned some output".
+        #
+        # There MUST be a user message. The first version put the goal in the system
+        # prompt and sent nothing else, which worked with one model and failed with
+        # another: "No user query found in messages" is a template-rendering error, and
+        # it arrived as an HTTP 400 that read like a bad payload. The requirement is
+        # ordinary and the omission was invisible until a stricter model met it.
         for m in self._wire:
             msgs.append(m)
 
@@ -576,6 +598,13 @@ class ReactLoop:
             try:
                 self.ctx.charge_tool(action)
                 obs = self._dispatch(action, args)
+                # Page BEFORE the model sees it, and say how much was hidden. A model
+                # shown a truncated `find` cannot tell "no more matches" from "the
+                # rest was cut off", and it guesses the flattering one -- reporting 12
+                # files when there were 400.
+                if obs.text and obs.text.count("\n") > 60:
+                    obs.text = page_observation(obs.text, limit=60)
+                    obs.truncated = True
             except BudgetExhausted as e:
                 self.ctx.note(f"react budget exhausted at turn {n}: {e}")
                 return ReactResult(None, "budget", steps)
@@ -595,6 +624,20 @@ class ReactLoop:
                          detail=f"{action} -> {obs.status} ({verdict.value})",
                          status=obs.status, turn=n, verdict=verdict.value,
                          duration_ms=obs.duration_ms)
+
+            # Feed the scratchpad and the stuck detector. Both exist to stop the loop
+            # re-deriving what it already knows: the model re-ran `ls -la` three times
+            # in one trajectory before, because nothing told it it already had.
+            argv_repr = " ".join(args.get("argv") or [])[:80]
+            if verdict is Verdict.pass_ and obs.status == "ok":
+                self.scratch.learn(f"`{argv_repr}` ran and produced evidence")
+            elif obs.status in ("blocked", "error"):
+                self.scratch.dead_end(f"`{argv_repr}` -> {obs.reason[:90]}")
+            if self.stuck.observe(verdict.value, argv_repr):
+                self.ctx.note(self.stuck.explain())
+                self.ctx.log("react", "stuck", detail=self.stuck.explain(),
+                             status="stuck", turn=n)
+                return ReactResult(None, "stuck", steps)
 
             # Feed only FILE CONTENTS into the taint set, never a directory listing.
             # A filename in an `ls` listing is not an injection -- it is a name the

@@ -239,7 +239,7 @@ def _cap_tail(text: str, cap: int) -> str:
     """
     if len(text) <= cap:
         return text
-    return "... [truncated]\n" + text[-cap:]
+    return f"... [truncated, showing last {cap} chars]\n" + text[-cap:]
 
 
 def _drain_bounded(proc: subprocess.Popen, cap: int,

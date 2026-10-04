@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from . import llm
@@ -86,6 +87,49 @@ class StageResult:
 
 
 # --------------------------------------------------------------------------- stages
+def _draft_answer(query: str, res: "StageResult") -> str:
+    """A candidate answer for a stage that found things but phrased nothing.
+
+    Only used as the THING BEING VERIFIED, never as the thing shown: if it survives
+    the checks the rubric writes a better sentence from the same evidence. It is
+    deliberately plain and entirely derived from `res.evidence`, because a draft that
+    adds anything is a draft the verifier will (correctly) reject.
+    """
+    if not res.evidence:
+        return ""
+    heads = []
+    for e in res.evidence[:6]:
+        cmd = " ".join(str(c) for c in e.get("command", []))[:80]
+        body = str(e.get("output") or "")[:1200]
+        heads.append(f"$ {cmd}\n{body}")
+    return "\n".join(heads)
+
+
+def _render_hits(hits: list[dict]) -> str:
+    """Turn a tool's hits into the same shape the loop produces, so ONE verifier and
+    ONE set of code-first checks apply to every strategy.
+
+    Without this the direct stage's evidence has a different shape from the loop's and
+    the path/number checks -- which read `evidence[i]["output"]` -- had nothing to check
+    on the direct path. A check that finds no text is not a passing check; it is a
+    check that did not run, and it looked like verification passing.
+    """
+    if not hits:
+        return "(no matches)"
+    lines: list[str] = []
+    for h in hits[:40]:
+        p = h.get("path")
+        if not p:
+            continue
+        line = str(p)
+        if h.get("score") is not None:
+            line += f"   (score {h['score']})"
+        if h.get("kind") == "folder":
+            line += "   [folder]"
+        lines.append(line)
+    return "\n".join(lines) or "(no matches)"
+
+
 def _direct_stage(query: str, *, ctx: TaskContext, use_llm_verify: bool) -> StageResult:
     """One cheap tool call, and nothing else.
 
@@ -102,8 +146,28 @@ def _direct_stage(query: str, *, ctx: TaskContext, use_llm_verify: bool) -> Stag
     intent = extract_intent(query)
     result = run_agent(query, ctx=ctx, root=ctx.root)
     tried = [f"{s.get('by', 'tool')}: {s.get('query', '')}" for s in result.get("searches", [])]
-    n_exact = sum(1 for h in result.get("similar_files", []) if h.get("exact"))
-    n_near = len(result.get("similar_files", []))
+    # `agents.run_agent` does not label hits as exact or fuzzy; it returns paths and a
+    # score. So exactness is computed HERE, from the intent the router extracted,
+    # rather than read off a field that does not exist. The first version read
+    # `h.get("exact")`, which is always None, so `n_exact` was always 0 and EVERY
+    # direct result was downgraded to `near_miss` and escalated -- the eval showed
+    # 0/12 direct cases succeeding.
+    #
+    # Exact means: the query named a literal filename, and a returned path's name
+    # contains it. Anything else is a fuzzy near-miss, which must NOT be shown as an
+    # answer -- that is the plan's removal of difflib guessing from the answer path.
+    wanted = [f for f in (intent.get("filenames") or []) if f]
+    hits = result.get("similar_files", [])
+    if wanted:
+        low = [w.lower() for w in wanted]
+        exact = [h for h in hits
+                 if any(w in Path(str(h.get("path", ""))).name.lower() for w in low)]
+    else:
+        # No literal filename in the query ("how many images are there"), so a hit
+        # from find/grep/survey is as exact as it gets.
+        exact = [h for h in hits if h.get("score", 0) >= 0.999] or hits
+    n_exact = len(exact)
+    n_near = len(hits)
 
     cost = {"tool_calls": ctx.counters.tool_calls, "seconds":
             round(time.perf_counter() - t0, 2)}
@@ -117,8 +181,9 @@ def _direct_stage(query: str, *, ctx: TaskContext, use_llm_verify: bool) -> Stag
         return StageResult(outcome="not_found", strategy="direct",
                            reason="nothing matched", tried=tried, cost=cost)
 
-    return StageResult(outcome="found", strategy="direct", text=None,
-                       evidence=[h for h in result.get("similar_files", []) if h.get("exact")],
+    return StageResult(outcome="found", strategy="direct",
+                       evidence=[{"command": ["find"] + list(wanted),
+                                  "output": _render_hits(exact)}],
                        reason=f"{n_exact} exact match(es)", tried=tried,
                        verified=False, cost=cost)
 
@@ -334,9 +399,16 @@ def plan_path(query: str, *, ctx: TaskContext, strategy: str = "auto",
 
         # The plan's order: VERIFY (code first) THEN SYNTHESIZE, and only verified
         # text reaches the user. A `found` from a stage is a CANDIDATE, not an answer.
-        if res.outcome == "found" and res.text:
+        if res.outcome == "found":
+            # The plan's order: VERIFY, then SYNTHESIZE from verified evidence only.
+            # A stage can succeed by finding the right thing without having phrased it
+            # -- `direct` returns paths, not prose -- so synthesis runs even when the
+            # stage brought its own text. It is what turns evidence into an answer,
+            # and it runs after the code-first checks so the model only ever sees
+            # evidence that survived them.
+            candidate = res.text or _draft_answer(query, res)
             verified_text, vwhy = synthesize_verified(
-                query, res.text, res.evidence, ctx=ctx, use_llm_verify=use_llm_verify)
+                query, candidate, res.evidence, ctx=ctx, use_llm_verify=use_llm_verify)
             if verified_text:
                 res.text = verified_text
                 res.verified = True
