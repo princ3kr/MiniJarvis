@@ -31,19 +31,68 @@ def test_needs_plan_counts_multiple_named_files(ctx):
     assert decided is True and why == "multiple files named", why
 
 
-def test_needs_plan_gate_never_selects_react():
-    """KNOWN BUG (removal scheduled, Phase 1): the gate returns a bool, so there is no
-    value it can return that reaches the ReAct strategy. `run_task(strategy='auto')`
-    can only ever choose direct or plan."""
-    # every query shape the gate knows about collapses to a two-valued answer
-    for q in ["hello", "find main.py", "count the images then report", "a.py and b.py"]:
-        out = needs_plan(q)
-        assert isinstance(out[0], bool)
-        assert len(out) == 2
-    # and the auto branch in run_task only ever assigns two strategies
-    from jarvis.engine import run_task
-    src = run_task.__doc__
-    assert "react  -- dspy.ReAct adaptive loop" in src
+def test_the_gate_can_now_reach_react():
+    """The bug this file used to pin, inverted.
+
+    `needs_plan` returned a bool, so no value it could return ever reached the ReAct
+    strategy -- `run_task(strategy="auto")` could choose direct or plan and nothing
+    else. Every query therefore took the same two paths, and a diagnostic question
+    got a one-shot file search and a confident wrong answer.
+
+    `strategy.route` replaces it with a three-way decision, so this asserts all three
+    rungs are reachable from a plain query.
+    """
+    from jarvis.strategy import route
+
+    for q, want in [
+        ("where is safe_resolve defined", "direct"),
+        ("compare a.py and b.py then report the differences", "plan"),
+        ("why does the test suite fail", "react"),
+        ("what is the disk usage of Downloads", "react"),
+        ("run the tests and tell me the error", "react"),
+    ]:
+        assert route(q).strategy == want, f"{q!r} -> {route(q).strategy}, want {want}"
+
+
+def test_every_strategy_is_reachable_from_auto():
+    """Not a property of the cue table -- a property of the ladder. `auto` has three
+    rungs and all three must be enterable, because a rung nothing can reach is code
+    that looks wired up and never runs."""
+    from jarvis.strategy import route
+
+    seen = {route(q).strategy for q in [
+        "where is x defined", "compare a.py and b.py", "why does it fail"]}
+    assert seen == {"direct", "plan", "react"}
+
+
+def test_the_ladder_escalates_in_order():
+    """`escalate_to` is what makes this a ladder rather than a one-shot guess."""
+    from jarvis.strategy import route
+
+    assert route("where is x").escalate_to == "plan"
+    assert route("compare a.py and b.py").escalate_to == "react"
+    assert route("why does it fail").escalate_to is None      # top of the ladder
+
+
+def test_route_is_deterministic_and_cheap():
+    """No model call. A classifier here would cost a round trip before any work
+    happens, and would be a second place to be wrong -- the routing model and the
+    answering model could disagree with neither being debuggable from the trace."""
+    from jarvis.strategy import route
+
+    a = route("why does the build fail")
+    b = route("why does the build fail")
+    assert a == b
+
+
+def test_routing_reacts_to_what_the_question_NEEDS_not_its_wording():
+    """The signal is whether the answer is command output, not whether words trip a
+    cue. `du` of a directory is a reading task in spirit and a command in practice."""
+    from jarvis.strategy import route
+
+    # both are about files, both would be hopeless for find/grep/read alone
+    assert route("how many images are there").strategy == "direct"
+    assert route("how much disk space is left").strategy == "react"
 
 
 def test_needs_plan_cue_is_a_substring_not_a_phrase():

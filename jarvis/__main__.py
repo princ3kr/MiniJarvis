@@ -41,7 +41,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="preflight the LLM config and exit")
     ap.add_argument("--strategy", default="auto",
                     choices=["auto", "direct", "plan", "react"],
-                    help="auto routes via the cheap gate; react is Phase 3")
+                    help="auto routes then escalates direct -> plan -> react; "
+                         "a pinned strategy does NOT escalate")
+    ap.add_argument("--react", action="store_true",
+                    help="force the shell loop, and show the full trajectory")
+    ap.add_argument("--max-turns", type=int, default=None,
+                    help="cap the react loop (default: min(12, budget.max_iterations))")
     ap.add_argument("--no-verify", action="store_true",
                     help="structural-only verification (no rubric, no LLM for the judge)")
     ap.add_argument("--root", default=None, help="directory to search (must be in scope)")
@@ -62,10 +67,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     settings = load_settings()
+    strategy = "react" if args.react else args.strategy
     with new_task(args.query, settings=settings, root=args.root) as ctx:
         from .engine import run_task
+        if strategy == "react" and args.max_turns:
+            # Pin the turn cap only when asked, so the budget stays the default
+            # authority for how long a loop may run.
+            ctx.budget = ctx.budget.__class__(
+                **{**ctx.budget.__dict__, "max_iterations": args.max_turns})
         try:
-            answer = run_task(args.query, ctx=ctx, strategy=args.strategy,
+            answer = run_task(args.query, ctx=ctx, strategy=strategy,
                               use_llm_verify=not args.no_verify)
         except NotImplementedError as e:
             print(f"\n{e}", file=sys.stderr)

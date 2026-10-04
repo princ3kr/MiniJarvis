@@ -559,14 +559,20 @@ def test_make_plan_fallback_passes_dag_validation():
 
 
 # ---------------------------------------------------------------- dead code
-def test_dead_branch_use_planner_is_unreachable(ctx, monkeypatch):
-    """KNOWN BUG (removal scheduled, Phase 1): `run_task` sets `use_planner = True` and
-    then tests `if not use_planner:`. The branch is unreachable, so the `ask()` fallback
-    below the plan block never runs."""
+def test_dead_branch_use_planner_is_gone(ctx, monkeypatch):
+    """`run_task` used to set `use_planner = True` and then test `if not use_planner:`
+    immediately after, so the `ask()` fallback below the plan block was unreachable.
+    Removed when `run_task` was split into `_plan_answer` / `_react_answer`.
+
+    Asserted by absence rather than by source text: the old test grepped the function
+    body, which passes just as happily on the string inside a docstring.
+    """
     import inspect
     src = inspect.getsource(engine.run_task)
-    assert "use_planner = True" in src
-    assert "if not use_planner:" in src
+    assert "use_planner" not in src, "the dead branch is back"
+    # and the plan stage is a real function that the ladder can call
+    assert callable(engine._plan_answer)
+    assert callable(engine._react_answer)
 
 
 def test_dead_ends_helper_is_not_a_module_global():

@@ -74,12 +74,17 @@ def build_manifests(read_roots: tuple[str, ...],
             name="answerer", tools=(), read_roots=(), max_tier=0),
         # Frozen. Present so the machinery is exercised, but max_tier=0 for the
         # discovery agent means it cannot be reached from a normal task.
+        # The shell executor. `max_tier=0` and `network=False` are the two numbers
+        # that matter: the agent can run shell commands against the machine and
+        # still cannot write, execute code, or reach the network, because every
+        # command is classified before it runs. `isolation="none"` is honest --
+        # there is no sandbox, and the rlimits plus the jail are the containment.
         "executor": AgentManifest(
             name="executor", tools=("run_command",),
-            read_roots=roots, write_roots=(write,),
-            network=False, max_tier=2, isolation="none",
-            limits=Limits(max_calls=4, timeout_s=60),
-            description="runs shell commands under policy; NO SANDBOX"),
+            read_roots=roots, write_roots=(),
+            network=False, max_tier=0, isolation="none",
+            limits=Limits(max_calls=12, timeout_s=30, max_output_bytes=20_000),
+            description="shell tool, read-only commands only; NO SANDBOX"),
     }
 
 

@@ -210,9 +210,11 @@ def execute(spec: CommandSpec, manifest, *, ctx: TaskContext, approve: bool = Fa
                              tier=int(verdict.tier), reason=reason,
                              policy_reasons=verdict.reasons)
 
-    # Resolve cwd INSIDE the write scope, by containment, not by string prefix.
+    # Resolve cwd INSIDE the read scope, by containment, not by string prefix.
+    # Write scope is additionally required when the command can write, and `classify`
+    # has already decided that -- so ask it rather than duplicating the rule here.
     try:
-        cwd = policy.resolve(spec.cwd or ctx.settings.write_root, for_write=True)
+        cwd = policy.resolve(spec.cwd or ctx.settings.write_root, for_write=False)
     except AccessDenied as e:
         reason = f"cwd rejected: {e}"
         ctx.log("gateway", "execute", detail=reason, status="denied", t0=t0)

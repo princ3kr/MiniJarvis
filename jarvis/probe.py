@@ -250,16 +250,24 @@ def section_gateway(ws: Path, settings, manifests, gw: Gateway) -> None:
     # Approval is per exact argv AND per task. Two independent things, and both are
     # checked here: an approval in one task must not authorise the same argv in
     # another, and it must not authorise a DIFFERENT argv in the same task.
+    #
+    # This section needs a manifest that PERMITS tier 2. `executor` is max_tier=0 --
+    # the safe default -- so a tier-2 command is DENIED by the manifest cap before
+    # approval is ever consulted, and the case would fail for the wrong reason. The
+    # approval machinery only exists above tier 0, so testing it needs a manifest that
+    # gets there. This is not a loosening of what ships: it is a test fixture.
+    approving = manifests["executor"].model_copy(update={"name": "executor_approving",
+                                                         "max_tier": 3})
     ctx4 = new_task("probe", settings=settings, root=ws)
     a = CommandSpec(argv=["/usr/bin/env", "/usr/bin/python3", "-c", "print(1)"],
                     why="probe")
     ctx5 = new_task("probe", settings=settings, root=ws)
     b = CommandSpec(argv=["/usr/bin/env", "/usr/bin/python3", "-c", "print(2)"],
                     why="probe")
-    r1 = gw.execute(a, ex, ctx=ctx4)               # tier 2, no approval yet
-    r2 = gw.execute(a, ex, ctx=ctx4, approve=True)  # approved, same argv
-    r3 = gw.execute(a, ex, ctx=ctx5)               # same argv, DIFFERENT task
-    r4 = gw.execute(b, ex, ctx=ctx4)               # different argv, SAME task
+    r1 = gw.execute(a, approving, ctx=ctx4)               # tier 2, no approval yet
+    r2 = gw.execute(a, approving, ctx=ctx4, approve=True)  # approved, same argv
+    r3 = gw.execute(a, approving, ctx=ctx5)               # same argv, DIFFERENT task
+    r4 = gw.execute(b, approving, ctx=ctx4)               # different argv, SAME task
     _record("gateway", "approval does not leak to another task",
             "PASS" if (r1.status == "declined" and r3.status == "declined"
                        and r2.status != "declined") else "PERMISSIVE",
@@ -267,6 +275,12 @@ def section_gateway(ws: Path, settings, manifests, gw: Gateway) -> None:
     _record("gateway", "approval is per exact argv, not per task",
             "PASS" if r4.status == "declined" else "PERMISSIVE",
             f"different argv in an approved task -> {r4.status}")
+
+    # And the tier ceiling must be what stops a tier-2 command when nobody approves.
+    r5 = gw.execute(a, ex, ctx=ctx4)
+    _record("gateway", "default executor cannot reach tier 2 at all",
+            "PASS" if r5.status == "denied" else "PERMISSIVE",
+            f"max_tier=0 -> {r5.status}: {r5.reason[:44]}")
 
 
 # --------------------------------------------------------------------------- 5

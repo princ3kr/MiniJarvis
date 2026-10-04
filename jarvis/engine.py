@@ -39,7 +39,7 @@ from .context import BudgetExhausted, TaskContext
 from .planner import (AgentResult, DSPY_OK, IMPLEMENTED_AGENTS, Plan, Step, StepStatus,
                       configure_dspy, make_plan, make_plan_fallback, replan)
 from .prompts import NOT_FOUND_REPLY, build_llm_messages, build_prompt_bundle
-from .router import needs_plan
+from .strategy import route
 from .trace import FailureType, Verdict
 from .verifier import verify_step
 
@@ -360,46 +360,114 @@ def ask(user_query: str, *, ctx: TaskContext, top_files: int = 3,
 def run_task(query: str, *, ctx: TaskContext, strategy: str = "auto",
              use_llm_verify: bool = True,
              replans_left: int = MAX_REPLANS) -> str | None:
-    """Main entry.
+    """Main entry. `strategy="auto"` walks the ladder and escalates on failure.
 
     strategy:
-      auto   -- single-step -> direct ask(); otherwise plan-execute (deterministic)
+      auto   -- route, then escalate direct -> plan -> react as stages fail to settle
       direct -- one searchFiles call, no planner
       plan   -- planner + orchestrator + verifier
-      react  -- dspy.ReAct adaptive loop
+      react  -- the shell loop: think, act, verify, repeat
 
-    KNOWN BUG (removal scheduled, Phase 3): `react` raises NotImplementedError. The ReAct
-    loop, `REACT_TOOLS`, `_t_read` and `render_trajectory` are not ported yet, and the
-    `needs_plan` gate can never select this strategy anyway (see router.py), so nothing
-    reaches it except an explicit `strategy="react"`. Phase 3 ports the loop and makes
-    the escalation ladder able to reach it.
+    The ladder, not a classifier, is what makes `auto` trustworthy. A three-way
+    classifier has to be right about every query on the first try, and guessing low
+    (direct) costs one call, so `route()` only has to be roughly right -- the
+    escalation recovers the rest. Concretely: if `direct` returns nothing, try
+    `plan`; if the plan cannot settle it either, try `react`. This is what was
+    missing: the old gate could only ever choose direct-or-plan, so a diagnostic
+    question silently got a one-shot file search and a confident wrong answer.
     """
     if strategy == "auto":
-        use_planner, why = needs_plan(query, ctx=ctx)
-        strategy = "plan" if use_planner else "direct"
-        ctx.log("route", "strategy", detail=f"{strategy} ({why})", status="ok",
-                strategy=strategy, reason=why, tool="router")
+        r = route(query, ctx=ctx)
+        strategy = r.strategy
+        ctx.log("route", "strategy",
+                detail=f"{strategy} ({r.reason})", status="ok",
+                strategy=strategy, reason=r.reason, tool="router")
         print(f"  strategy: {strategy}")
+        return _escalate(query, ctx=ctx, start=strategy,
+                         use_llm_verify=use_llm_verify,
+                         replans_left=replans_left)
 
     if strategy == "direct":
-        return ask(query, ctx=ctx)
+        answer = ask(query, ctx=ctx)
+        if answer is not None:
+            return answer
+        # Explicitly asked for direct and direct found nothing. Do NOT quietly
+        # escalate: the caller pinned the strategy, and silently spending more
+        # budget than asked for is its own bug. Say it and stop.
+        ctx.note("strategy='direct' found nothing; not escalating because the "
+                 "strategy was pinned. Use strategy='auto' to climb the ladder.")
+        return None
 
     if strategy == "react":
-        # PHASE 3 GAP: the ReAct loop is not ported yet. Raised loudly rather than
-        # silently falling through to the planner, which would answer a different
-        # question than the one asked.
-        raise NotImplementedError(
-            "strategy='react' is not implemented yet; the ReAct loop lands in Phase 3. "
-            "Use strategy='direct' or 'plan'.")
+        return _react_answer(query, ctx=ctx, use_llm_verify=use_llm_verify)
 
     if strategy != "plan":
         raise ValueError(f"unknown strategy {strategy!r}")
 
-    use_planner = True
+    return _plan_answer(query, ctx=ctx, use_llm_verify=use_llm_verify,
+                        replans_left=replans_left)
 
-    if not use_planner:      # KNOWN BUG (removal scheduled, Phase 1): dead branch.
-        return ask(query, ctx=ctx)      # `use_planner` was just set True above.
 
+def _escalate(query: str, *, ctx: TaskContext, start: str, use_llm_verify: bool,
+              replans_left: int) -> str | None:
+    """Walk the ladder from `start`, moving up when a stage cannot settle the query.
+
+    A stage "fails" by returning nothing, not by raising. The last rung returns its
+    own honest `None` -- `inconclusive` is a real outcome and pretending otherwise
+    would mean guessing.
+    """
+    order = ["direct", "plan", "react"]
+    try:
+        i = order.index(start)
+    except ValueError:
+        raise ValueError(f"unknown strategy {start!r}")
+
+    for stage in order[i:]:
+        ctx.log("route", "escalate", detail=f"trying {stage}", status="ok",
+                stage=stage, tool="router")
+        answer = _run_stage(stage, query, ctx=ctx, use_llm_verify=use_llm_verify,
+                            replans_left=replans_left)
+        if answer:
+            return answer
+        nxt = order[order.index(stage) + 1] if order.index(stage) + 1 < len(order) else None
+        if nxt is None:
+            ctx.note("react exhausted its turns without settling the question; "
+                     "reporting inconclusive rather than guessing.")
+            return None
+        ctx.note(f"{stage} could not settle the question; escalating to {nxt}.")
+        print(f"  {stage} found nothing -> escalating to {nxt}")
+
+    return None
+
+
+def _run_stage(stage: str, query: str, *, ctx: TaskContext, use_llm_verify: bool,
+               replans_left: int) -> str | None:
+    if stage == "direct":
+        return ask(query, ctx=ctx)
+    if stage == "plan":
+        return _plan_answer(query, ctx=ctx, use_llm_verify=use_llm_verify,
+                            replans_left=replans_left)
+    if stage == "react":
+        return _react_answer(query, ctx=ctx, use_llm_verify=use_llm_verify)
+    raise ValueError(f"unknown stage {stage!r}")
+
+
+def _react_answer(query: str, *, ctx: TaskContext, use_llm_verify: bool) -> str | None:
+    from .react import run_react
+
+    print("  react: think -> act -> verify")
+    r = run_react(query, ctx=ctx, use_llm_verify=use_llm_verify)
+    if r.steps:
+        print(r.render()[-4000:])
+    if r.answer:
+        return r.answer
+    if r.status != "answered":
+        ctx.note(f"react ended {r.status} after {r.turns} turn(s)")
+    return None
+
+
+def _plan_answer(query: str, *, ctx: TaskContext, use_llm_verify: bool,
+                 replans_left: int) -> str | None:
     t0 = time.perf_counter()
 
     # DSPy is configured lazily, and ONLY when a plan is actually needed. Without
@@ -502,4 +570,5 @@ def run_task(query: str, *, ctx: TaskContext, strategy: str = "auto",
 
 
 __all__ = ["MAX_REPLANS", "MAX_STEPS_PER_PLAN", "ready_steps", "blocked_steps",
-           "execute_plan", "run_task", "ask", "synthesize"]
+           "execute_plan", "run_task", "ask", "synthesize",
+           "_escalate", "_react_answer", "_plan_answer"]

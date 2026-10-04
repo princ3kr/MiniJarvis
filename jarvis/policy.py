@@ -16,7 +16,7 @@ from typing import Any, Callable, Literal, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .access import AccessDenied, AccessPolicy
+from .access import SECRET_DIRS, AccessDenied, AccessPolicy
 from .context import TaskContext  # for reference
 from .redaction import redact
 
@@ -175,6 +175,13 @@ class Grammar:
 
 
 def _split_flag(token: str) -> tuple[str, str | None]:
+    """Split a flag into (name, attached value).
+
+    Handles `--long`, `--long=value`, `-s`, `-s=value`, and the ATTACHED short form
+    `-d:` / `-f1` / `-n5`. The attached form is the gap that let `cut -d: -f1 f`
+    fail: getopt accepts `-d:` as `-d` with value `:`, so anything that does not
+    understand it reports an unknown flag for a perfectly ordinary command line.
+    """
     if token.startswith("--"):
         if "=" in token:
             return token.split("=", 1)
@@ -182,6 +189,21 @@ def _split_flag(token: str) -> tuple[str, str | None]:
     if token.startswith("-") and len(token) > 1 and "=" in token:
         return token.split("=", 1)
     return token, None
+
+
+def _split_attached_short(token: str, grammar: Grammar) -> tuple[str, str | None] | None:
+    """`-d:` -> ('-d', ':') when `-d` is a known value-taking flag. Else None.
+
+    Only consulted for a token that is not itself in the flag map, so a real flag
+    name is never mis-split.
+    """
+    if not token.startswith("-") or token.startswith("--") or len(token) < 3:
+        return None
+    head = token[:2]
+    spec = grammar._map.get(head)
+    if spec is None or spec.takes == "none":
+        return None
+    return head, token[2:]
 
 
 def _is_flag_like(token: str) -> bool:
@@ -250,6 +272,11 @@ def validate_grammar(grammar: Grammar, argv: list[str]) -> GrammarResult:
             continue
         head, val_eq = _split_flag(tok)
         spec = grammar._map.get(head)
+        if spec is None:
+            attached = _split_attached_short(tok, grammar)
+            if attached is not None:
+                head, val_eq = attached
+                spec = grammar._map.get(head)
         if spec is None:
             # POSIX short-option bundling: `-cf`, `-rf`, `-la` are ONE token, not
             # three. Without this, `tar -cf out.tar .` classifies as "unknown flag
@@ -528,19 +555,46 @@ def make_diff_grammar() -> Grammar:
 
 
 def make_sort_uniq_tr_cut_which() -> Grammar:
+    # One table for five binaries, which is why several flags carry several meanings:
+    # `-c` is "count" to uniq, "chars" to tr and "characters" to cut. That is
+    # acceptable because the grammar validates SYNTAX; whether the flag means what the
+    # user intended is the binary's business, not the policy's.
     flags = [
+        # sort
         FlagSpec("-n", "none"),
         FlagSpec("-r", "none"),
-        FlagSpec("-k", "string"),
-        FlagSpec("-t", "string"),
-        FlagSpec("-f", "none"),
+        FlagSpec("-u", "none"),
+        FlagSpec("-h", "none"),
+        FlagSpec("-f", "any"),
+        FlagSpec("-g", "any"),
+        FlagSpec("-V", "any"),
+        FlagSpec("-M", "any"),
+        # uniq
+        FlagSpec("-c", "none"),
         FlagSpec("-d", "none"),
         FlagSpec("-i", "none"),
-        FlagSpec("-u", "none"),
-        FlagSpec("-c", "none"),
         FlagSpec("-D", "none"),
-        FlagSpec("-z", "none"),
+        # tr
         FlagSpec("-s", "none"),
+        # cut: `-d` and `-f` may carry an attached value, so `cut -d: -f1` parses.
+        # They are "any" rather than "path" -- `-d:` is a DELIMITER, not a path, and
+        # treating it as a path made every `cut -d:` escalate for looking out of scope.
+        FlagSpec("-d", "any"),
+        FlagSpec("-f", "any"),
+        # shared
+        FlagSpec("-t", "any"),
+        FlagSpec("-z", "none"),
+        FlagSpec("--field-separator", "string"),
+        FlagSpec("--delimiter", "string"),       # cut: --delimiter=: is the long form
+        FlagSpec("--only-fields", "any"),
+        FlagSpec("--fields", "any"),
+        FlagSpec("--only-delimited", "none"),
+        FlagSpec("--complement", "none"),
+        FlagSpec("--output-delimiter", "string"),
+        FlagSpec("--sort", "any"),
+        FlagSpec("--count", "none"),             # uniq --count
+        FlagSpec("--all", "none"),               # uniq --all
+        FlagSpec("--repeated", "none"),          # uniq --repeated
         FlagSpec("--version", "none"),
         FlagSpec("--help", "none"),
     ]
@@ -631,18 +685,90 @@ def make_tar_grammar() -> Grammar:
     return Grammar("tar", flags)
 
 
-def make_head_tail_wc_stat_file_grammar() -> Grammar:
+def make_head_tail_wc_grammar() -> Grammar:
+    """head / tail / wc.
+
+    Split from `stat` and `file` deliberately. They were one table, and `-c` is the
+    collision: `wc -c f` and `head -c 20 f` take no value, while `stat -c '%s' f`
+    REQUIRES one. Declaring it either way breaks the other two -- as "none" it made
+    `stat -c %s` scope-check `%s` as a path operand and escalate a read-only command
+    to tier 2, which is how `stat` became unusable from the loop. One table per set
+    of tools that actually agree on their flags.
+    """
     flags = [
-        FlagSpec("-n", "number"),
-        FlagSpec("-c", "number"),
-        FlagSpec("-q", "none"),
-        FlagSpec("-v", "none"),
-        FlagSpec("-f", "path"),
+        # value-LESS selectors, so they can be BUNDLED: `wc -lw`, `head -n20`.
+        # Typing them as value-taking made the commonest wc invocation fail.
+        FlagSpec("-l", "none"),            # wc: count lines
+        FlagSpec("-m", "none"),            # wc: count chars
+        FlagSpec("-w", "none"),            # wc: count words
+        FlagSpec("-c", "none"),            # head/tail: bytes (GNU); wc: count bytes
+        FlagSpec("-b", "none"),            # head: bytes
+        FlagSpec("-L", "none"),            # tail: follow symlinks
+        FlagSpec("-n", "number"),          # head/tail: lines; wc --lines
+        FlagSpec("-q", "none"),            # wc: quiet
+        FlagSpec("-v", "none"),            # tail: verbose; wc version
+        FlagSpec("-f", "path"),            # tail: follow
+        FlagSpec("-z", "none"),            # wc: NUL-delimited
+        FlagSpec("-s", "none"),
+        FlagSpec("--bytes", "none"),
+        FlagSpec("--lines", "none"),
+        FlagSpec("--chars", "none"),
+        FlagSpec("--words", "none"),
+        FlagSpec("--follow", "none"),
+        FlagSpec("--silent", "none"),
+        FlagSpec("--quiet", "none"),
+        FlagSpec("--verbose", "none"),
+        FlagSpec("--dereference", "none"),
         FlagSpec("--help", "none"),
         FlagSpec("--version", "none"),
-        FlagSpec("-z", "none"),
     ]
     return Grammar("util", flags)
+
+
+def make_stat_grammar() -> Grammar:
+    """stat alone, because `-c` and `-f` both take a value here and do not elsewhere.
+
+    `stat -c '%s' file` is the standard way to get a size, so getting this wrong
+    removes size queries from the agent's vocabulary entirely.
+    """
+    flags = [
+        FlagSpec("-c", "any"),            # --format=: THE common form
+        FlagSpec("-f", "path"),           # --format= without the leading -
+        FlagSpec("-L", "none"),           # follow symlinks
+        FlagSpec("-l", "none"),
+        FlagSpec("-n", "none"),
+        FlagSpec("-r", "none"),
+        FlagSpec("-s", "none"),
+        FlagSpec("-t", "none"),           # terse
+        FlagSpec("-z", "none"),
+        FlagSpec("--format", "string"),
+        FlagSpec("--printf", "string"),
+        FlagSpec("--terse", "none"),
+        FlagSpec("--dereference", "none"),
+        FlagSpec("--filesystem", "none"),
+        FlagSpec("--help", "none"),
+        FlagSpec("--version", "none"),
+    ]
+    return Grammar("stat", flags)
+
+
+def make_file_grammar() -> Grammar:
+    """file alone: its flags are boolean, and `-f`/`-b` mean nothing like wc's."""
+    flags = [
+        FlagSpec("-b", "none"),           # brief
+        FlagSpec("-i", "none"),           # mime type
+        FlagSpec("-L", "none"),
+        FlagSpec("-h", "none"),
+        FlagSpec("-k", "none"),
+        FlagSpec("-z", "none"),
+        FlagSpec("--brief", "none"),
+        FlagSpec("--mime-type", "none"),
+        FlagSpec("--mime-encoding", "none"),
+        FlagSpec("--dereference", "none"),
+        FlagSpec("--help", "none"),
+        FlagSpec("--version", "none"),
+    ]
+    return Grammar("file", flags)
 
 
 def make_du_df_sha_realpath_readlink_tree() -> Grammar:
@@ -657,8 +783,35 @@ def make_du_df_sha_realpath_readlink_tree() -> Grammar:
         FlagSpec("-x", "none"),
         FlagSpec("-P", "none"),
         FlagSpec("-H", "none"),
+        FlagSpec("-a", "none"),            # du: all files, not just directories
+        FlagSpec("-d", "number"),          # du: --max-depth short form
+        FlagSpec("-l", "none"),            # du: count links
+        FlagSpec("-n", "none"),            # du: one line per file
+        FlagSpec("-q", "none"),
+        FlagSpec("--max-depth", "number"),  # du: `du --max-depth=2 .` is common
+        FlagSpec("--exclude", "any"),      # du's ONLY exclusion flag. Accepting it
+                                           # is what makes the gateway's recursion
+                                           # requirement satisfiable for du.
+        FlagSpec("--exclude-dir", "any"),
+        FlagSpec("--apparent-size", "none"),
+        FlagSpec("--total", "none"),
+        FlagSpec("--si", "none"),
+        FlagSpec("--inode", "none"),
+        FlagSpec("-L", "number"),          # tree: level, `tree -L 2` -- DOES take a value
+        FlagSpec("-a", "none"),            # tree: all
+        FlagSpec("-d", "none"),            # tree: dirs only
+        FlagSpec("-f", "none"),            # tree: full paths
+        FlagSpec("-I", "any"),             # tree: ignore pattern
+        FlagSpec("-P", "none"),            # tree: show permissions
+        FlagSpec("--du", "none"),          # du --du
+        FlagSpec("--inodes", "none"),
+        FlagSpec("-i", "none"),            # df: inodes
+        FlagSpec("-T", "none"),            # df: filesystem type
+        FlagSpec("-p", "none"),            # df: portable
         FlagSpec("--version", "none"),
         FlagSpec("--help", "none"),
+        FlagSpec("--color", "string"),     # du/tree/df colouring
+        FlagSpec("--all", "none"),
     ]
     return Grammar("util", flags)
 
@@ -698,17 +851,38 @@ def _check_git(argv: list[str]) -> GrammarResult:
 
 
 def make_git_grammar() -> Grammar:
+    # Global flags only. Per-subcommand flags (`git log --oneline`, `git log -n 5`)
+    # are deliberately NOT listed here: enumerating them means enumerating every
+    # subcommand's surface, which is exactly the blocklist-shaped approach that made
+    # the notebook's validator permissive. Anything unrecognised escalates to
+    # APPROVAL, which is safe, and `_check_git` already denies the dangerous
+    # subcommands and retargeting flags outright.
     flags = [
         FlagSpec("--version", "none"),
         FlagSpec("--help", "none"),
         FlagSpec("--no-pager", "none"),
         FlagSpec("--paginate", "none"),
+        FlagSpec("--no-color", "none"),
+        FlagSpec("--color", "any"),
         FlagSpec("-p", "none"),
         FlagSpec("-q", "none"),
         FlagSpec("--quiet", "none"),
-        FlagSpec("--verbose", "none"),
         FlagSpec("-v", "none"),
-        FlagSpec("--no-color", "none"),
+        FlagSpec("--verbose", "none"),
+        FlagSpec("-n", "number"),
+        FlagSpec("--max-count", "number"),
+        FlagSpec("-c", "any"),            # --pretty=..., --color=...
+        FlagSpec("--stat", "none"),
+        FlagSpec("--short", "none"),
+        FlagSpec("--name-only", "none"),
+        FlagSpec("--name-status", "none"),
+        FlagSpec("--oneline", "none"),
+        FlagSpec("--decorate", "none"),
+        FlagSpec("--all", "none"),
+        FlagSpec("--graph", "none"),
+        FlagSpec("--no-recurse-submodules", "none"),
+        FlagSpec("--ignore-submodules", "none"),
+        FlagSpec("-m", "any"),
     ]
     return Grammar("git", flags)
 
@@ -818,16 +992,30 @@ RECURSIVE_FLAGS: dict[str, tuple[str, ...]] = {
 # them a bare invocation is already a walk and no flag is needed to trigger it.
 _ALWAYS_DESCEND = frozenset({"find", "du", "tree", "tar"})
 
-# Basenames that must be excluded, regardless of what `policy.deny_globs` says.
-# The globs are path-shaped (`**/.env`), and a walk needs directory names to
-# prune on, so these are named explicitly.
-_ALWAYS_PRUNE_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".gnome")
+# Basenames a recursive walk must exclude. SECRET_DIRS only, and deliberately not
+# `skip_dirs`.
+#
+# `skip_dirs` is a NOISE decision -- `.git`, `node_modules`, `__pycache__` are not
+# secrets, they are just not worth walking. Requiring a model to pass 30
+# `--exclude-dir` flags for them made `du` and `grep -r` effectively unusable: the
+# agent got refused, could not construct a command that passes, and burned turns
+# guessing. The first version of this rule required skip_dirs plus the deny globs
+# and it was a real usability failure observed in a live loop.
+#
+# The secrecy requirement is SECRET_DIRS. That is the part that must not be
+# optional, and it is short enough to state in one error message. `node_modules`
+# being walkable is the jail's noise policy, not this rule's business -- exactly the
+# walkable-vs-nameable distinction `access.py` draws.
+_ALWAYS_PRUNE_DIRS = tuple(sorted(SECRET_DIRS))
 
 
 def _required_exclusions(access: AccessPolicy) -> set[str]:
-    return (set(access.skip_dirs) | set(_ALWAYS_PRUNE_DIRS)
-            | {Path(g).name for g in access.deny_globs
-               if Path(g).name and "*" not in Path(g).name})
+    # `access` is still a parameter and is still used: deny_globs can be extended at
+    # runtime via Settings, and a caller who adds a secret directory there should get
+    # it enforced here too without editing the policy module.
+    return set(_ALWAYS_PRUNE_DIRS) | {
+        Path(g).name for g in access.deny_globs
+        if Path(g).name and "*" not in Path(g).name and Path(g).name in SECRET_DIRS}
 
 
 def _check_recursion(binary: str, argv: list[str], access: AccessPolicy) -> tuple[bool, str]:
@@ -869,13 +1057,31 @@ def _check_recursion(binary: str, argv: list[str], access: AccessPolicy) -> tupl
         return True, ""
 
     required = _required_exclusions(access)
-    present = {a.split("=", 1)[-1].lstrip("-").split("/", 1)[-1]
-               for a in argv if a.startswith("-")}
+    present = set()
+    for a in argv:
+        if not a.startswith("-"):
+            continue
+        val = a.split("=", 1)[-1]
+        # Accept every spelling a tool might use, so the requirement is satisfiable
+        # by each tool's own idiom: `--exclude-dir=NAME`, `du --exclude=NAME`, and
+        # `rg --glob !**/NAME/**`. A requirement no tool can satisfy is a requirement
+        # that trains the model to stop asking -- and `du` genuinely has no
+        # `--exclude-dir`, so checking only that spelling made `du` unusable.
+        val = val.lstrip("-").split("/", 1)[-1]
+        for sep in ("**/", "/**", "/"):
+            if sep in val:
+                val = val.split(sep)[-1]
+        present.add(val)
+        present.add(a.split("=", 1)[0].lstrip("-"))
     missing = sorted(d for d in required if d not in present)
     if missing:
-        return False, (f"{binary} recurses but does not exclude deny-listed "
-                       f"directories: missing {' '.join(missing[:6])}"
-                       + (" ..." if len(missing) > 6 else ""))
+        # Short and complete on purpose. This string is fed back to the model as the
+        # observation for a refused command, and the first version listed 30 skip
+        # directories, got truncated at the trajectory's 700-char window, and left
+        # the agent unable to construct a command that would pass. A refusal the
+        # caller cannot act on is a refusal that costs a turn for nothing.
+        return False, (f"{binary} recurses; add an exclusion for each of: "
+                       + " ".join(missing))
     return True, ""
 
 
@@ -902,8 +1108,10 @@ def _build_grammars() -> dict[str, Grammar]:
     # anything the model did.
     g["sed"] = make_sed_grammar()
     g["tar"] = make_tar_grammar()
-    for b in ("head", "tail", "wc", "stat", "file"):
-        g[b] = make_head_tail_wc_stat_file_grammar()
+    for b in ("head", "tail", "wc"):
+        g[b] = make_head_tail_wc_grammar()
+    g["stat"] = make_stat_grammar()
+    g["file"] = make_file_grammar()
     for b in ("du", "df", "sha256sum", "realpath", "readlink", "tree"):
         g[b] = make_du_df_sha_realpath_readlink_tree()
     for b in ("sort", "uniq", "tr", "cut", "which"):
@@ -1207,18 +1415,43 @@ def classify(spec: CommandSpec, manifest, *, access: AccessPolicy,
             reasons.append(f"path outside read scope: {operand}")
             tier = max(tier, Tier.APPROVAL)
 
-    # 9. cwd
+    # 9. cwd.
+    #
+    # READ scope is the requirement, not WRITE. The first version resolved cwd with
+    # `for_write=True`, which meant a read-only agent could not run a single command
+    # inside the tree it was asked to search: `ls` in a readable directory was
+    # refused because the agent had no write access there. That is not a security
+    # property, it is the agent unable to do its job, and it showed up as
+    # "tier 2 exceeds max_tier 0" for commands that are plainly tier 0.
+    #
+    # Write scope is additionally required when the command can actually write,
+    # which is the tier floor -- computed below. So a reader may stand anywhere it
+    # can read, and a writer may only stand where it may write.
     if spec.cwd:
         try:
-            access.resolve(spec.cwd, for_write=True)
+            access.resolve(spec.cwd, for_write=False)
         except AccessDenied as e:
             if e.reason == "denied":
                 return PolicyVerdict(tier=Tier.DENIED,
                                      reason=f"cwd blocked by deny-list: {spec.cwd}",
                                      binary=binary, binary_resolved=binary_path,
                                      reasons=[str(e)])
-            reasons.append(f"cwd outside write scope: {spec.cwd}")
+            reasons.append(f"cwd outside read scope: {spec.cwd}")
             tier = max(tier, Tier.APPROVAL)
+        # A writer needs a cwd it may write. Checked here rather than after the
+        # floor so the message names cwd and not the generic tier.
+        if binary in TIER1_FLOOR or int(tier) >= int(Tier.REVERSIBLE):
+            try:
+                access.resolve(spec.cwd, for_write=True)
+            except AccessDenied as e:
+                if e.reason == "denied":
+                    return PolicyVerdict(tier=Tier.DENIED,
+                                         reason=f"cwd blocked by deny-list: {spec.cwd}",
+                                         binary=binary, binary_resolved=binary_path,
+                                         reasons=[str(e)])
+                reasons.append(f"writing command with cwd outside write scope: "
+                               f"{spec.cwd}")
+                tier = max(tier, Tier.APPROVAL)
 
     # 10. write targets
     if binary in ("cp", "mv", "mkdir", "touch", "ln") and manifest.write_roots:
@@ -1231,10 +1464,26 @@ def classify(spec: CommandSpec, manifest, *, access: AccessPolicy,
                 reasons.append(f"write target outside workspace: {a}")
                 tier = max(tier, Tier.APPROVAL)
 
-    # 11. tainted: args echo content we read. A file can say "run this".
-    if spec.tainted:
+    # 11. taint, but ONLY for commands that can actually do damage.
+    #
+    # Taint exists because a file can say "run this": its content reaches the model,
+    # and the model can echo that content back as argv. That is a real vector.
+    #
+    # Escalating a TIER-0 command for it was a mistake, and an observed one. The
+    # ReAct loop feeds every observation into the taint set, so after one `ls -la`
+    # every filename in the directory was tainted -- and reading any file the agent
+    # had just listed required approval. The agent was unable to read the directory
+    # it had listed. A control that blocks the task it exists to protect gets
+    # disabled or worked around.
+    #
+    # A tier-0 command cannot write, execute, or reach the network, so it is not a
+    # payload no matter whose text it carries. Taint therefore gates TIER >= 1, where
+    # it does something.
+    if spec.tainted and int(tier) >= int(Tier.REVERSIBLE):
         reasons.append("arguments echo content read from a file (possible injection)")
         tier = max(tier, Tier.APPROVAL)
+    elif spec.tainted:
+        reasons.append("tainted argv, but tier 0 cannot write or execute")
 
     # 12. tier floor. A clean grammar does not make a writer read-only.
     tier = apply_tier_floor(binary, tier, reasons)
