@@ -20,7 +20,7 @@ __all__ = ["Observation", "ToolSpec", "TOOL_MANIFEST"]
 
 from . import find, grep, read, survey
 from .observation import Observation
-from .base import run_subprocess
+from .base import exclusion_flags, run_tool
 
 TOOL_MANIFEST.update({
     "find": ToolSpec(

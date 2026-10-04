@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import subprocess
 import time
 from pathlib import Path
 
 from ..access import AccessPolicy, AccessDenied
 from ..config import NO_TEXT_EXT, Settings
 from ..context import TaskContext
+from .base import run_tool
 from .observation import Observation
 
 
@@ -77,12 +77,8 @@ def search_content(query: str, *, ctx: TaskContext, root: Path | str | None = No
         cmd = _build_grep_cmd(query, base, policy, ctx.settings, regex=regex,
                               max_per_file=max_pf, case_sensitive=case_sensitive)
 
-    try:
-        from ..redaction import scrubbed_env
-        out = subprocess.run(cmd, capture_output=True, text=True,
-                             timeout=limits.timeout_s, check=False,
-                             env=scrubbed_env(workspace=base), shell=False)
-    except subprocess.TimeoutExpired:
+    out = run_tool(cmd, cwd=base, timeout_s=limits.timeout_s)
+    if out.status == "timeout":
         dur = (time.perf_counter() - t0) * 1000
         return Observation(tool="grep", status="error", reason="timeout", duration_ms=dur)
 

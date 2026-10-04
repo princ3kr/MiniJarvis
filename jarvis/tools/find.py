@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import difflib
 import fnmatch
-import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -10,6 +9,7 @@ from typing import Any
 from ..access import AccessPolicy, AccessDenied
 from ..config import Settings
 from ..context import TaskContext
+from .base import run_tool
 from .observation import Observation
 
 
@@ -59,18 +59,14 @@ def _find_raw(pattern: str | None, base: Path, policy: AccessPolicy, settings: S
         # -iname MUST come before -print
         cmd += ["-iname", pattern]
     cmd.append("-print")
-    try:
-        from ..redaction import scrubbed_env
-        out = subprocess.run(cmd, capture_output=True, text=True,
-                             timeout=settings.limits.timeout_s, check=False,
-                             env=scrubbed_env(workspace=base), shell=False)
-    except subprocess.TimeoutExpired:
-        if ctx:
-            try:
-                ctx.log("find", "search", status="timeout")
-            except Exception:
-                pass
-        return []
+    # One runner for every tool: scrubbed env, rlimits, process-group kill and a
+    # byte cap. A timeout is a status, not an exception that escapes the tool.
+    out = run_tool(cmd, cwd=base, timeout_s=settings.limits.timeout_s)
+    if out.status == "timeout" and ctx:
+        try:
+            ctx.log("find", "search", status="timeout")
+        except Exception:
+            pass
     lines = [l for l in out.stdout.splitlines() if l.strip()]
     return lines[:limit] if limit else lines
 

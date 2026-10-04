@@ -10,8 +10,7 @@ from .observation import Observation
 
 
 def _find_raw_survey(pattern: str | None, base: Path, policy: AccessPolicy, settings: Settings) -> list[str]:
-    import subprocess
-    from ..redaction import scrubbed_env
+    from .base import run_tool
     cmd = ["find", str(base)]
     # prune skip dirs
     cmd += ["("]
@@ -21,12 +20,7 @@ def _find_raw_survey(pattern: str | None, base: Path, policy: AccessPolicy, sett
             cmd.append("-o")
         cmd += ["-name", d]
     cmd += [")", "-prune", "-o", "-type", "f", "-print"]
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True,
-                             timeout=settings.limits.timeout_s, check=False,
-                             env=scrubbed_env(workspace=base), shell=False)
-    except subprocess.TimeoutExpired:
-        return []
+    out = run_tool(cmd, cwd=base, timeout_s=settings.limits.timeout_s)
     lines = [l for l in out.stdout.splitlines() if l.strip()]
     return lines
 

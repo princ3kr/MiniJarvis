@@ -221,6 +221,14 @@ def execute_plan(plan: Plan, *, ctx: TaskContext, plan_version: int = 1,
             new_plan = replan(plan.goal, _verified_digest(plan), failure,
                               ctx=ctx, max_replans=replans_left)
         except Exception as e:
+            # KNOWN BUG (removal scheduled, Phase 1): a revised plan that depends on an
+            # ALREADY-PINNED step is rejected here by `Plan`'s DAG validator, because the
+            # revised plan is validated standalone and does not contain the pinned steps.
+            # `RevisePlan` explicitly asks for "only the REMAINING steps", so any
+            # dependency-chained plan cannot be replanned at all: the call fails, the run
+            # stops at the current version, and the reason is buried in an attempt record.
+            # This is why the notebook's own "verified results stay pinned" test passed
+            # vacuously -- its fake replan had a dangling dep and never ran.
             _log_attempt(plan_version, Step(id=-1, agent="planner",
                                            instruction="replan", expected_output=""),
                          None, Verdict.fail,
@@ -233,6 +241,15 @@ def execute_plan(plan: Plan, *, ctx: TaskContext, plan_version: int = 1,
         # flat offset is wrong: the planner's new deps refer to the ORIGINAL ids,
         # and pinned steps keep theirs, so a blind offset left deps pointing at ids
         # that no longer exist.
+        #
+        # KNOWN BUG (removal scheduled, Phase 1): the map is built pinned-first, so a new
+        # step whose id COLLIDES with a pinned id OVERWRITES the pinned entry. The
+        # planner is told "return only the REMAINING steps, renumbered from 1", so
+        # collision is the expected case, not the exotic one: with pinned id 1, the map
+        # becomes {1: 2, ...} and any new step that says `depends_on: [1]` is wired to the
+        # FIRST NEW STEP instead of the pinned one. It runs in the wrong order and reports
+        # a plausible-looking result. Phase 1 builds the map in two passes (pinned
+        # entries win) and asserts the two id spaces are disjoint first.
         offset = max((s.id for s in pinned), default=0)
         id_map = {s.id: s.id for s in pinned}
         for n, s in enumerate(new_plan.steps, 1):
@@ -246,6 +263,10 @@ def execute_plan(plan: Plan, *, ctx: TaskContext, plan_version: int = 1,
         for s in plan.steps:
             if any(d not in live_ids for d in s.depends_on):
                 s.depends_on = [d for d in s.depends_on if d in live_ids]
+        # KNOWN BUG (removal scheduled, Phase 1): `plan.steps = pinned + new` DROPS the
+        # failed and inconclusive steps. Their ids can then be reissued to a retry step,
+        # so `run["failed"]` and the trace can name the same id for two different
+        # instructions. The attempts survive in `ctx.trace`; the plan does not.
         plan_version += 1
         replans_left -= 1
         _log_attempt(plan_version,

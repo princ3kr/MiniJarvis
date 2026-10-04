@@ -143,24 +143,56 @@ test proving each removal. Marked `# KNOWN BUG (removal scheduled)` in the sourc
 | bug | where | removed in |
 |---|---|---|
 | `needs_plan` substring cues misfire; never picks ReAct | `router` | Phase 4 (classifier + ladder) |
-| `run_executor` takes step text as literal argv | `engine` | Phase 1 (typed `CommandSpec`) |
-| blocklist validators miss `=`-attached flags | `policy` | Phase 1 (flag allowlists) |
-| policy keys on `basename(argv[0])` | `policy` | Phase 1 (absolute resolution) |
-| blanket `tainted` flag blocks legitimate discovery operands | `policy` | Phase 1 (position-aware taint) |
+| `MAX_STEPS_PER_PLAN` is decorative; the cap is a literal elsewhere | `engine` | Phase 1 (one setting) |
+| `use_planner` branch is unreachable | `engine` | Phase 4 |
 | regex intent detection + huge extension list | `agents` | Phase 3 (index + fast-path only) |
-| `webSearch`/`assistant` in the planner's vocabulary, unimplemented | `planner` | Phase 5 |
+| `webSearch` declared in the planner's vocabulary, unimplemented | `manifests` | Phase 5 |
 | snapshot/undo, tier 1/2, approvals, interpreters | frozen | Phase 6+ |
+
+### Removed, and proved removed
+
+Each of these was a probe finding against the notebook's executor. They are fixed, and
+`python -m jarvis.probe` is the regression net — **zero PERMISSIVE is the bar**.
+
+| finding | fix |
+|---|---|
+| `find -fprint0` wrote a file at tier 0 | dangerous-flag set in `policy` |
+| `cat`/`ls`/`diff`/`grep` read outside the read roots | every PATH operand resolves through the jail |
+| policy keyed on `basename(argv[0])`, so `./cat` and `/tmp/git` classified as the real tools | `argv[0]` must be absolute **and** in `TRUSTED_BIN_DIRS`; `PATH` is not trusted because it contains `~/.local/bin` |
+| `git commit`/`add`/`branch -D` were all tier 0 | git subcommand tier split; `config alias.*` denied |
+| `git diff --output=`, `--git-dir=`, `-C` retargeted or wrote | each denied explicitly |
+| approval key was `" ".join(argv)`, so `["a b"]` matched `["a","b"]` | `ctx.fingerprint` is `\x00`-joined |
+| approvals lived in a module set, shared across tasks | per-task `ctx.approvals` |
+| `exit_code` postcondition did `str(v) in _LAST_EXIT`, so "1" matched "10" | exact comparison |
+| `file_exists` postcondition called `Path(p).exists()` unscoped, probing `/root/.ssh` through the exit status | postconditions resolve through the jail; unresolvable is a FAIL, not a pass |
+| `grep -r` walked into deny-listed dirs (`decoy-marker` leaked) | `_check_recursion` **requires** the exclusions to be present in argv |
+| `env python3 x.py` classified tier 0 | `env` is a launcher: the wrapped command is re-classified, `LD_PRELOAD`-class assignments denied |
+| `pip show` reached the network at tier 0 | network binaries denied without a sandbox |
+| unbounded output buffered without limit | bounded ring in `runner`; overflow kills the group |
+| `communicate()` on timeout left grandchildren holding the pipes | `killpg` on the child's own session |
+| executor never re-checked `max_calls` | charged and enforced per task |
+
+Two more things the probe found that were not findings but would have been. `sed` and
+`tar` had real grammars that were never wired into the registry, so every `sed -n` and
+`tar -cf` escalated to APPROVAL for no reason — a refusal caused by the policy's own
+wiring, which trains a model to stop asking. And POSIX short-flag bundling (`-cf`) was
+unknown, so ordinary `tar` syntax was treated as suspicious.
 
 ## Test layers
 
 ```
 tests/test_access.py    the jail: escapes, symlinks, deny-list depth
+tests/test_index.py     deny-list at WRITE time; read-only SQL; staleness reported
 tests/test_tools.py     find/grep/read/survey against a tmp fixture tree
-tests/test_policy.py    the probe as pytest — zero PERMISSIVE is the bar
+tests/test_runner.py    env scrubbing, group kill, rlimits, the output cap
+tests/test_router.py    query shape + intent extraction
 tests/test_planner.py   DAG, JSON repair, replan id remap, dead ends
-tests/test_verifier.py  verdict semantics, especially unsure-vs-fail
-tests/test_engine.py    ready queue, repeat rejection, budget exhaustion
 ```
 
-No test may touch the network or walk a real tree. The `network`, `live`, and
-`slow` markers exist for the cases that legitimately need to.
+The probe is `python -m jarvis.probe`, a module rather than a notebook cell: a safety
+property that lives only inside a notebook is one nobody runs. It exits non-zero on any
+PERMISSIVE finding. Three cases are reported **INCONCLUSIVE** rather than PASS — `rg`
+is not installed on this machine, so the policy refuses it for being unknown, which
+proves nothing about `rg`.
+
+No test may touch the network or walk a real tree.
