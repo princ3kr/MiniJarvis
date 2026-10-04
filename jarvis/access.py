@@ -100,6 +100,25 @@ def is_denied(path, patterns: tuple[str, ...]) -> tuple[bool, str]:
     return False, ""
 
 
+# Directories whose mere EXISTENCE is sensitive. The deny-globs above are path
+# patterns like `~/.ssh/*`, which match a key file but not the folder containing it,
+# so `is_denied("~/.ssh")` was False and a folder listing named `.ssh/` as a child.
+# No contents leaked -- `resolve` refuses the key inside it -- but publishing the
+# existence of a private-key directory to a remote model is a disclosure of its
+# own, and it is free to prevent. Listed by basename so it works at any depth.
+# Keyed by BASENAME, and every entry is a single path segment. `.gnome/keyring`
+# was in the first draft and never matched: `walkable` compares `path.name` to the
+# set, and `path.name` is `keyring`, never `.gnome/keyring`. A silently-inert entry
+# in a security list is worse than a missing one, because the list reads as
+# coverage. `.gnome` is NOT listed: it also holds ordinary application config, and
+# `.config` is deliberately walkable -- so `.gnome` has to be too, with the keyring
+# below it named individually.
+SECRET_DIRS: frozenset[str] = frozenset({
+    ".ssh", ".gnupg", ".kube", ".aws", ".docker", "keyring",
+    ".git-credentials", ".password-store",
+})
+
+
 @dataclass(frozen=True)
 class AccessPolicy:
     """Read scope plus deny-list plus the skip list. Immutable; safe to share."""
@@ -236,6 +255,30 @@ class AccessPolicy:
         already names the ones that are noise.
         """
         if path.name in self.skip_dirs:
+            return False
+        if path.name in SECRET_DIRS:
+            return False
+        denied, _ = is_denied(path, self.deny_globs)
+        return not denied
+
+    def nameable(self, path: Path) -> bool:
+        """May this path be NAMED in output -- a listing, a count, a histogram?
+
+        Narrower than `walkable`, because the two answer different questions.
+        `walkable` asks "is descending here worth it?" and `node_modules` fails
+        that. But a folder summary listing its children should still be able to say
+        `node_modules/` exists: it is not a secret, it is noise, and hiding it makes
+        "what is in this folder" wrong in a way that reads as absence rather than as
+        filtering.
+
+        `.ssh` fails this. Its existence is not the user's to publish, and a
+        transcript that names it has already told a remote model something.
+
+        So: deny-list plus `SECRET_DIRS`, never `skip_dirs`. Skip-dirs is a cost and
+        hygiene decision, not a secrecy one; conflating the two is what made a folder
+        summary announce `.ssh/` while hiding `__pycache__`.
+        """
+        if path.name in SECRET_DIRS:
             return False
         denied, _ = is_denied(path, self.deny_globs)
         return not denied

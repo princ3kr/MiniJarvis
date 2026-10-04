@@ -46,7 +46,14 @@ def settings(tmp_workspace):
         llm=LLMConfig(),
         read_roots=(tmp_workspace,),
         write_root=tmp_workspace / "w",
-        deny_globs=("*id_rsa*", "*.env", "*/.env", "*/.ssh/*", ".env", "*/*.env"),
+        # A realistic deny-list, not a token one. A fixture with three globs makes
+        # every containment test pass for the wrong reason -- it never asks whether
+        # `.env.production` or a nested `id_rsa.pub` is covered, and those are the
+        # variants that actually appear on disk.
+        deny_globs=(
+            "*/id_rsa*", "*/id_ed25519*", "*.pem", "*.key",
+            "*/.env", "*/.env.*", "*/.netrc", "*_rsa",
+        ),
         skip_dirs=frozenset({".git", "node_modules", "__pycache__"}),
     )
 

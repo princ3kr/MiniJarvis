@@ -30,6 +30,7 @@ copy that drifted is how `find -iname` ended up AFTER `-print` in one of them.
 from __future__ import annotations
 
 import difflib
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -123,19 +124,36 @@ def _describe_dir(d: Path | str, *, ctx: TaskContext,
     this, "show me the rust project" returned a folder hit with `read_status: not_found`
     and the answer said the folder could not be read -- technically true, useless.
 
-    KNOWN BUG (removal scheduled, Phase 3): the child listing filters `skip_dirs` but the
-    recursive histogram does NOT. So `__pycache__` is hidden from the folder listing and
-    its files are still counted in "N file(s) in total", and in the extension histogram.
-    The two halves of one folder summary disagree about what exists. Phase 3 makes both
-    walk through `policy.walkable`.
+    Both halves of the summary -- the child listing and the recursive histogram --
+    prune through `policy.walkable`. That was a KNOWN BUG (removal scheduled, Phase 3)
+    and it is fixed here rather than carried, because the fix is small and the bug had
+    two faces:
+
+      * the child listing filtered `skip_dirs` while the histogram did not, so
+        `__pycache__` was hidden from the listing yet its files were still counted in
+        "N file(s) in total". Two halves of one summary disagreeing about what exists
+        is worse than either being wrong alone.
+      * the name check was not the jail. `.ssh` is not in `skip_dirs`, so the listing
+        announced `.ssh/` as a child folder. No secret leaked -- this function does not
+        read contents -- but a summary that enumerates a private-key directory by name
+        is one edit away from doing so.
+
+    `os.walk` with an in-place prune of `dirnames`, rather than `rglob` filtered
+    afterwards: pruning the descent means an excluded tree is never entered and never
+    stat-ed, and "a file exists here" is itself a disclosure.
     """
     t0 = time.perf_counter()
     policy = AccessPolicy.from_settings(ctx.settings, cwd=ctx.root or Path.cwd())
     try:
         d = policy.resolve(d)
-        kids_dirs = [c.name + "/" for c in sorted(d.iterdir())
-                     if c.is_dir() and c.name not in ctx.settings.skip_dirs]
-        kids_files = [c.name for c in sorted(d.iterdir()) if c.is_file()]
+        # Listing uses `nameable` (deny-list only) and the histogram uses
+        # `walkable` (deny-list + skip_dirs). The split is deliberate: the listing
+        # should say `node_modules/` exists, since hiding it makes the answer wrong;
+        # the histogram should not count 30,000 vendored files, since that is noise.
+        # `.ssh` is denied by both, so it appears in neither.
+        kids = [c for c in sorted(d.iterdir()) if policy.nameable(c)]
+        kids_dirs = [c.name + "/" for c in kids if c.is_dir()]
+        kids_files = [c.name for c in kids if c.is_file()]
     except (OSError, PermissionError) as e:
         return {"path": str(d), "kind": "folder", "is_dir": True, "score": 0.0,
                 "read_status": "error", "truncated": False,
@@ -145,13 +163,20 @@ def _describe_dir(d: Path | str, *, ctx: TaskContext,
     counts: dict[str, int] = {}
     sub_files = sub_dirs = 0
     try:
-        for p in d.rglob("*"):
-            if p.is_dir():
-                sub_dirs += 1
-            elif p.is_file():
+        # os.walk, not rglob: mutating `dirs` in place is the documented way to prune
+        # a descent, so an excluded tree is never entered -- and never stat-ed, which
+        # matters because "a file exists here" is itself a disclosure.
+        for dirpath, dirnames, filenames in os.walk(d):
+            keep = [x for x in dirnames if policy.walkable(Path(dirpath) / x)]
+            sub_dirs += len(keep)
+            dirnames[:] = keep          # prune, do not merely filter
+            for fn in filenames:
+                p = Path(dirpath) / fn
+                if policy.try_resolve(p, for_write=False) is None:
+                    continue
                 sub_files += 1
-                e = p.suffix.lower() or "(no ext)"
-                counts[e] = counts.get(e, 0) + 1
+                ext = p.suffix.lower() or "(no ext)"
+                counts[ext] = counts.get(ext, 0) + 1
     except OSError:
         pass
     top_ext = sorted(counts.items(), key=lambda kv: -kv[1])[:6]
