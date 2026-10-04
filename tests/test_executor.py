@@ -92,18 +92,43 @@ def test_shell_metacharacters_are_refused_with_a_usable_reason(ctx, shell):
     assert "For further information" not in o.reason
 
 
-def test_a_recursive_command_needs_the_exclusions(ctx, shell):
+def test_the_policy_injects_the_exclusions_not_the_model(ctx, shell):
+    """The model should NOT have to know the secret-directory list.
+
+    It was asked to, and it got it wrong three turns running: `-not -path */.ssh/*`
+    is not a form the grammar accepts, so every attempt was refused and the loop
+    burned its budget. The policy now appends them, which is both more secure (the
+    model cannot forget) and more usable (the model cannot get it wrong).
+    """
     o = shell(["du", "-sh", "."], why="size")
-    assert o.status == "blocked"
-    assert "exclusion" in o.reason
-    # and the message must LIST them, or the agent cannot construct a passing command
+    assert o.status == "ok", f"the policy should have made this safe: {o.reason}"
+    argv = o.items[0]["argv"]
+    assert len(argv) > 3, "no exclusions were appended"
+    joined = " ".join(argv)
     for d in (".ssh", ".aws", ".gnupg", ".kube"):
-        assert d in o.reason, f"{d} missing from the refusal message"
+        assert d in joined, f"{d} was not excluded: {joined[:200]}"
+    # and the REAL argv is what is reported, which is what the trace shows
+    assert o.items[0]["argv"] is not None
 
 
-def test_a_recursive_command_with_the_exclusions_runs(ctx, shell):
-    o = shell(["du", "-sh", *EXCLUDES, "."], why="size")
-    assert o.status == "ok", o.reason
+def test_a_recursive_command_the_model_wrote_exclusions_for_is_not_doubled_up(ctx, shell):
+    """A model that already excluded `.ssh` should not get a second `--exclude=.ssh`."""
+    from jarvis.prune import inject
+    from jarvis.access import AccessPolicy
+    from jarvis.config import load_settings
+    pol = AccessPolicy.from_settings(load_settings(), cwd=ctx.root)
+    argv = ["/usr/bin/find", ".", "-not", "-path", "*/.ssh/*", "-name", "*.py"]
+    out = inject(argv, access=pol)
+    assert " ".join(out).count(".ssh") == 1, "the exclusion was duplicated"
+
+
+def test_a_walk_that_cannot_exclude_is_refused(ctx, shell):
+    """Fail closed. If the policy cannot express an exclusion for a walking binary,
+    the command does not run -- the guarantee is about what runs, not about what the
+    policy hoped it could arrange."""
+    from jarvis.gateway import _unpruned
+    assert _unpruned(["/usr/bin/find", ".", "-type", "f"])      # no exclusions
+    assert _unpruned(["/usr/bin/ls", "-la", "."]) == []            # not a walk
 
 
 def test_nonzero_exit_is_information_not_failure(ctx, shell):
@@ -215,7 +240,13 @@ class FakeCall:
 
 
 def _act(argv, why="probe"):
-    return {"thought": "try it", "action": "run_command", "args": {"argv": argv, "why": why}}
+    """A turn that runs a command, in the TEXT dialect."""
+    return {"thought": "try it", "command": list(argv), "why": why}
+
+
+def _say(answer, thought="done"):
+    """A turn that finishes, in the TEXT dialect."""
+    return {"thought": thought, "answer": answer}
 
 
 def _loop(ctx, actions=(), verdicts=("PASS: supported",), answers=("done.",), **kw):
@@ -265,10 +296,8 @@ def test_a_confabulated_finish_is_rejected_and_the_loop_continues(ctx, tmp_works
                       text="total 376\n-rw-r--r-- 1 u u 6264 f\n")
     step = Step(1, "t", "run_command", {"argv": ["ls", "-l"]}, obs)
     loop = _loop(ctx, actions=[
-        {"thought": "confabulate", "action": "finish",
-         "args": {"answer": "The total is approximately 37K."}},
-        {"thought": "better", "action": "finish",
-         "args": {"answer": "The total is 376 blocks."}},
+        _say("The total is approximately 37K."),
+        _say("The total is 376 blocks."),
     ], verdicts=["PASS: supported", "PASS: supported"],
         answers=["The directory uses 376 blocks."],
         use_llm_verify=True)
@@ -287,10 +316,8 @@ def test_a_confabulated_finish_is_rejected_and_the_loop_continues(ctx, tmp_works
 def test_finishing_with_no_successful_command_is_refused(ctx):
     """Finishing after only refusals means the answer is invented."""
     loop = _loop(ctx, actions=[
-        {"thought": "x", "action": "finish",
-         "args": {"answer": "There are 3 files."}},
-        {"thought": "x", "action": "finish",
-         "args": {"answer": "There are 4 files."}},
+        _say("There are 3 files."),
+        _say("There are 4 files."),
     ], use_llm_verify=True, max_turns=2)
     r = loop.run("what is here")
     assert r.answer is None
@@ -301,8 +328,7 @@ def test_a_refusal_becomes_trajectory_data_not_a_crash(ctx):
     loop = _loop(ctx, actions=[
         _act(["/usr/bin/sudo", "ls"]),                    # denied
         _act(["ls", "."]),                               # adapts
-        {"thought": "ok", "action": "finish",
-         "args": {"answer": "It is a project."}},
+        _say("It is a project."),
     ], answers=["It is a project."], use_llm_verify=True)
     r = loop.run("what is here")
     assert r.steps[0].verdict is Verdict.fail
@@ -318,8 +344,7 @@ def test_a_repeated_action_is_refused(ctx):
     loop = _loop(ctx, actions=[
         _act(["ls", "definitely-not-here"]),             # missing operand, empty
         _act(["ls", "definitely-not-here"]),             # same thing again
-        {"thought": "x", "action": "finish",
-         "args": {"answer": "Nothing there."}},
+        _say("Nothing there."),
     ], verdicts=["FAIL: no output", "FAIL: no output", "PASS: nothing there"],
         use_llm_verify=True)
     r = loop.run("what is here")
@@ -353,20 +378,35 @@ def test_malformed_decisions_do_not_burn_a_turn_silently(ctx):
     loop = _loop(ctx, actions=[
         "not json at all",
         _act(["ls", "."]),
-        {"thought": "ok", "action": "finish", "args": {"answer": "A project."}},
+        _say("A project.", "ok"),
     ], answers=["It is a project."], use_llm_verify=True)
     r = loop.run("what is here")
     assert r.status == "answered"
 
 
-def test_an_unknown_action_is_reported_not_guessed(ctx):
+def test_an_unparseable_turn_is_reported_not_guessed(ctx):
+    """A reply with neither a command nor an answer is a formatting slip, not a dead
+    end. It costs a turn and says so -- it must never be interpreted as anything."""
     loop = _loop(ctx, actions=[
-        {"thought": "x", "action": "teleport", "args": {}},
+        "I think I should probably run an ls somewhere.",
         _act(["ls", "."]),
-        {"thought": "ok", "action": "finish", "args": {"answer": "A project."}},
+        _say("A project.", "ok"),
     ], answers=["It is a project."], use_llm_verify=True)
     r = loop.run("what is here")
-    assert any("unknown action" in (s.observation.reason or "") for s in r.steps)
+    assert any("no action in reply" in s.reason for s in r.steps), \
+        [s.reason for s in r.steps]
+    assert r.status == "answered"
+
+
+def test_an_unknown_tool_name_is_refused(ctx):
+    """A native tool call naming a function the loop does not have must not be
+    guessed at. `toolspec` returns kind="none" for an unknown name, which the loop
+    treats as an unparseable turn."""
+    from jarvis.toolspec import from_tool_calls
+    d = from_tool_calls([{"message": {"tool_calls": [
+        {"function": {"name": "delete_everything", "arguments": "{}"}}]}}])
+    assert d.kind == "none"
+    assert d.source == "none"
 
 
 def test_budget_stops_the_loop_before_an_unpayable_call(ctx):

@@ -59,41 +59,52 @@ from .tools import grep as grep_tool
 from .tools import read as read_tool
 from .tools import survey as survey_tool
 from .tools.observation import Observation
+from .toolspec import TOOLS, from_text, from_tool_calls
 from .trace import Verdict
 
 __all__ = ["ReactLoop", "ReactResult", "run_react"]
 
-SYSTEM = """You are a careful shell agent working inside a sandboxed read-only scope.
+SYSTEM = """You answer questions about a filesystem by reading what commands print.
 
-You answer questions about a filesystem by RUNNING COMMANDS and READING THEIR OUTPUT.
-You cannot see files except through the output of commands you run.
+You cannot see any file directly. Everything you know about the filesystem comes out
+of a command you asked to run, on a later turn.
 
-Each turn, reply with exactly one JSON object and nothing else:
+REPLY FORMAT
 
-  {"thought": "...", "action": "run_command", "args": {"argv": ["ls", "-la"],
-   "why": "list the current directory"}}
+Reply with exactly one JSON object and nothing else. No prose, no markdown fence.
 
-  {"thought": "...", "action": "finish", "args": {"answer": "..."}}
+Two shapes. To run a command:
 
-Actions:
-  run_command  argv is a list of strings. NO SHELL: no pipes, no &&, no redirects,
-               no glob expansion. Run one command at a time.
-               Common ones that work: ls, cat, head, tail, wc, du, df, stat, file,
-               find, grep, git (status/log/diff/show), tree, sort, uniq, cut.
-               A RECURSIVE command (du, grep -r, find, ls -R) is refused unless it
-               excludes the private-key directories. Copy this form:
-                 du -sh --exclude=.ssh --exclude=.aws --exclude=.gnupg
-                      --exclude=.kube --exclude=keyring --exclude=.docker
-                      --exclude=.password-store --exclude=.git-credentials .
-  finish       when the evidence answers the question.
+  {"thought": "what I expect to learn", "command": ["ls", "-la"],
+   "why": "what this will tell me"}
 
-Rules:
-  - Look before you leap. If a command returned nothing useful, try a different one
-    rather than repeating it.
-  - NEVER invent a file path. Only refer to paths that appeared in command output.
-  - If a command is refused, read the reason and adapt. Do not retry it unchanged.
-  - When you have the evidence, finish. Do not keep running commands.
-  - Your final answer must be supported by output you actually saw."""
+To give your answer:
+
+  {"thought": "what I have established", "answer": "the answer, supported by output I saw"}
+
+These are fields in a JSON object you write. There is no function-calling interface
+here and nothing to invoke.
+
+COMMANDS
+
+`command` is a list of strings. No shell: no pipes, no &&, no redirects, no globs.
+One command per turn. Useful ones: ls, cat, head, tail, wc, du, df, stat, file, find,
+grep, git (status/log/diff/show), tree, sort, uniq, cut.
+
+The policy appends exclusions for you to any command that walks directories, so write
+`find . -type f -name '*.py'` and it will be made safe. Do not try to add exclusions
+yourself -- you will get the syntax wrong and the command will be refused.
+
+A command may be REFUSED, with a reason. Read the reason and try something different.
+Do not repeat a command you already ran.
+
+WHAT MATTERS
+
+  - Never invent a path. Only mention files that appeared in output you were shown.
+  - When the output answers the question, give the answer. Do not keep running
+    commands for tidiness.
+  - Your answer must be supported by output you actually saw. If it is not supported,
+    say what is missing instead."""
 
 ACTION_PROMPT = """{system}
 
@@ -191,10 +202,20 @@ class ReactResult:
     status: str                    # answered | inconclusive | budget | refused
     steps: list[Step] = field(default_factory=list)
     answer_source: str = ""        # which action produced the final answer
+    # Whether the evidence actually supports the answer. False means the finish was
+    # accepted on an unproven verdict, which is only reachable with `use_llm_verify
+    # =False` -- a debug mode. There is deliberately no status string for it: a status
+    # beginning with "answered" gets shown, and an unverified answer must not be.
+    verified: bool = True
 
     @property
     def turns(self) -> int:
         return len(self.steps)
+
+    @property
+    def showable(self) -> bool:
+        """May this be shown to a user as an answer? Only if it was verified."""
+        return bool(self.answer) and self.verified
 
     def render(self) -> str:
         out = [f"REACT: {self.status} after {self.turns} turn(s)"]
@@ -222,6 +243,12 @@ class ReactLoop:
         self._signatures: set[str] = set()
         self._goal = ""
         self.finish_rejections = 0
+        # The conversation, in the form the API wants it: an assistant message with
+        # `tool_calls`, then a `tool` message with the result. Kept per loop, so it
+        # dies with the loop -- a module-level conversation list would leak one task's
+        # filesystem into the next one's context, which is both a privacy bug and a
+        # correctness one.
+        self._wire: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------ dispatch
     def _dispatch(self, action: str, args: dict[str, Any]) -> Observation:
@@ -255,28 +282,50 @@ class ReactLoop:
                            reason=f"unknown action {action!r}")
 
     # ------------------------------------------------------------------ one turn
-    def _decide(self, goal: str, trajectory: str, n: int) -> tuple[dict[str, Any], str]:
-        """Ask the model for the next action. Returns (parsed, raw)."""
+    def _decide(self, goal: str, trajectory: str, n: int):
+        """Ask the model what to do next. Returns a `Decision`.
+
+        Uses NATIVE tool calling when the model supports it, and falls back to JSON-in-
+        text when it does not. Both are supported because "works with one model" is
+        not a property worth having, and the native path exists for a measured reason:
+        a tool-calling model refuses a request that describes running things but
+        supplies no tools ("HTTP 400: Tool choice is none, but model called a tool"),
+        and no payload flag works around it.
+        """
         msgs = [{"role": "system", "content": ACTION_PROMPT.format(
             system=SYSTEM, goal=goal, trajectory=trajectory or "(nothing yet)",
             n=n, max_turns=self.max_turns, budget=self._budget_line())}]
-        out = self._call(self.ctx, msgs, purpose="react_decide", temperature=0.0)
+        # The conversation is built incrementally: each observation is appended as a
+        # real `tool` message so the model can see WHAT CAME BACK, not a transcript
+        # flattened into prose. That is the difference between a model that can read a
+        # `wc -l` result and one that is told "the command returned some output".
+        for m in self._wire:
+            msgs.append(m)
+
+        out = self._call(self.ctx, msgs, purpose="react_decide", temperature=0.0,
+                         tools=TOOLS)
         raw = out.get("text", "")
-        try:
-            # `expect="object"`, and this is not a detail: the prompt asks for ONE
-            # object, so the array-first extractor either raises or returns the
-            # first *array* nested inside the reply. With `expect="array"` a
-            # perfectly good decision came back as `{}` -- the loop then saw "no
-            # action", logged a parse error, and burned a turn on a model that had
-            # answered correctly.
-            data = llm.extract_json(raw, expect="object")
-        except Exception:
-            return {}, raw
-        if isinstance(data, list) and data:
-            data = data[0]
-        if not isinstance(data, dict):
-            return {}, raw
-        return data, raw
+        if out.get("tool_calls"):
+            d = from_tool_calls(out.get("choices"))
+            self.ctx.log("react", "decide", detail=f"{d.kind} via native tool_call",
+                         status="ok", turn=n)
+            # Echo the assistant turn so the tool result below has something to attach
+            # to. An orphaned `tool` message is a 400 on most providers.
+            if out.get("choices"):
+                self._wire.append(dict(out["choices"][0].get("message") or {}))
+            return d, raw
+        d = from_text(raw)
+        self.ctx.log("react", "decide", detail=f"{d.kind} via json text",
+                     status="ok", turn=n)
+        return d, raw
+
+    def _wire_result(self, tool_call_id: str, obs: Observation) -> None:
+        """Append a tool result so the model can read what came back."""
+        body = (obs.text or obs.reason or "")[:2400]
+        if len(obs.text or "") > 2400:
+            body += f"\n... [truncated, {len(obs.text)} chars total]"
+        self._wire.append({"role": "tool", "tool_call_id": tool_call_id,
+                           "name": "run_shell", "content": body})
 
     def _budget_line(self) -> str:
         b = self.ctx.budget
@@ -417,18 +466,23 @@ class ReactLoop:
                 return ReactResult(None, "inconclusive", steps,
                                    answer_source="no valid decision")
 
-            action = str(data.get("action") or "").strip()
-            args = data.get("args") if isinstance(data.get("args"), dict) else {}
-            thought = str(data.get("thought") or "")[:600]
+            thought = data.thought[:600]
+            # `Decision` has already normalised both dialects (native tool call and
+            # JSON-in-text), so there is exactly one interpretation of a turn below
+            # this line. The vocabulary differences -- `action`/`args` vs
+            # `command`/`answer` -- are absorbed in `toolspec`.
+            args: dict[str, Any] = {}
+            if data.kind == "run":
+                args = {"argv": data.argv or [], "why": data.why}
+            action = {"run": "run_command", "finish": "finish"}.get(data.kind, "")
 
-            # No action, or an unparseable reply. Do not burn a turn silently --
-            # say so and retry, because a malformed reply is usually a formatting
-            # slip rather than a dead end.
+            # Nothing recognisable. Do not burn a turn silently -- say so and retry,
+            # because a malformed reply is usually a formatting slip, not a dead end.
             if not action:
                 self.ctx.log("react", "parse", detail=raw[:120], status="error")
                 s = Step(n, thought, "(none)", {},
                          Observation(tool="-", status="error",
-                                     reason="no action in reply"),
+                                     reason="neither 'command' nor 'answer' in reply"),
                          Verdict.fail, "no action in reply")
                 steps.append(s)
                 trajectory.append(s)
@@ -436,7 +490,7 @@ class ReactLoop:
 
             # finish
             if action in ("finish", "answer", "done", "stop"):
-                ans = str(args.get("answer") or data.get("answer") or "").strip()
+                ans = str(data.answer or args.get("answer") or "").strip()
                 if not ans:
                     s = Step(n, thought, action, args,
                              Observation(tool="-", status="error",
@@ -488,12 +542,17 @@ class ReactLoop:
                 self.ctx.log("react", "finish", detail=ans[:80],
                              status="ok" if verdict is Verdict.pass_ else "uncertain",
                              turn=n)
-                # An answer that came back `unsure` is returned, but the status says
-                # so. A caller that wants only proven answers can check `status`.
-                return ReactResult(ans,
-                                   "answered" if verdict is Verdict.pass_
-                                   else "answered_unverified",
-                                   steps, answer_source=action)
+                # There is no `answered_unverified` status. It existed for one commit
+                # and the plan removes it: an unverified answer is not an answer, and
+                # giving it a status that starts with "answered" means every caller
+                # that checks `if result.answer` shows it to a human.
+                #
+                # The value is still returned, because during development you want to
+                # SEE what the loop produced in order to fix the verification, and
+                # `--no-verify` exists for exactly that. What does not happen is it
+                # being labelled as answered. `verified=False` says which it is.
+                return ReactResult(ans, "answered", steps,
+                                   answer_source=action, verified=verdict is Verdict.pass_)
 
             # Repeat rejection. Per task, from the trajectory -- so it cannot leak
             # across tasks the way the notebook's module-level PATH_LOG did.

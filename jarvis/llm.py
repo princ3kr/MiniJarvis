@@ -29,6 +29,7 @@ which ones it burned.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -47,6 +48,17 @@ class LLMConfigError(RuntimeError):
     """The wiring is wrong: no key, bad key, unknown model, no base_url.
 
     Must be reported loudly. Retrying it wastes the budget and hides the real fault.
+    """
+
+
+class LLMReasoningExhausted(LLMUnavailable):
+    """A reasoning model spent the whole token budget on hidden reasoning.
+
+    Distinct from a generic transient failure because the FIX is different: it is not
+    "retry later", it is "ask for more tokens". `complete` catches it specifically and
+    retries once with 4x, which is what makes a reasoning model usable as a router --
+    a 120-token budget is spent entirely on reasoning and returns HTTP 200 with no
+    content, which is indistinguishable from a model that chose to say nothing.
     """
 
 
@@ -109,7 +121,8 @@ class LLMProvider(Protocol):
     name: str
 
     def complete(self, messages: list[dict], *, temperature: float,
-                 max_tokens: int, trace: Trace | None = None) -> dict:
+                 max_tokens: int, trace: Trace | None = None,
+                 tools: list[dict] | None = None) -> dict:
         """-> {"text": str, "usage": dict, "model": str}. Raises the two errors above."""
         ...
 
@@ -127,7 +140,7 @@ class HTTPProvider:
     name = "http"
 
     def _post(self, base_url: str, model: str, key: str, payload: dict,
-              trace: Trace | None, tag: str) -> dict:
+              trace: Trace | None, tag: str, _reasoning_retried: bool = False) -> dict:
         # `limit` is read back out of the payload only to make the empty-content
         # error actionable: "raise max_tokens" is useless without the number.
         import requests
@@ -177,30 +190,77 @@ class HTTPProvider:
         if code >= 500:
             self._log(trace, "llm", tag, f"HTTP {code}", t0, status="error")
             raise LLMUnavailable(f"server error HTTP {code}")
+        if code in (400, 422):
+            body = _short(r.text)
+            # Two very different 400s share a status code.
+            #
+            # "Failed to parse tool call arguments as JSON" is the MODEL producing
+            # malformed JSON in a tool call -- a sampling artefact, not a bad request.
+            # Retrying gets a different sample and usually works. Observed on
+            # gpt-oss-20b mid-conversation, where it killed the turn.
+            if "parse tool call" in body.lower() or "invalid json" in body.lower():
+                self._log(trace, "llm", tag, "malformed tool call", t0, status="retry")
+                raise LLMUnavailable(f"model emitted unparseable tool arguments: {body}")
+            # Everything else is our fault, permanently.
+            self._log(trace, "llm", tag, f"HTTP {code} bad request", t0,
+                      status="config_error")
+            raise LLMConfigError(
+                f"HTTP {code}: the endpoint rejected the request. This is not "
+                f"transient and retrying will not help. Endpoint said: {body}")
         if code != 200:
             self._log(trace, "llm", tag, f"HTTP {code}", t0, status="error")
-            raise LLMUnavailable(f"HTTP {code}: {r.text[:200]}")
+            raise LLMUnavailable(f"HTTP {code}: {_short(r.text)}")
 
         data = r.json()
         try:
-            text = data["choices"][0]["message"]["content"].strip()
+            message = data["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as e:
             self._log(trace, "llm", tag, "malformed response", t0, status="error")
-            raise LLMUnavailable(f"unexpected shape: {str(data)[:200]}") from e
+            raise LLMUnavailable(f"unexpected shape: {_short(str(data))}") from e
+
+        # A tool-call turn has NO `content` key at all -- not an empty one. `["content"]`
+        # raised KeyError and the whole call was reported as "unexpected shape", which
+        # is what made the first native-tool-calling run fail for a reason that had
+        # nothing to do with tool calling. `.get` with a default is the whole fix.
+        raw_content = message.get("content")
+        text = raw_content.strip() if isinstance(raw_content, str) else ""
 
         usage = data.get("usage") or {}
         reasoning = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+        tool_calls = message.get("tool_calls") or []
+
+        if not text and tool_calls:
+            # The normal shape of a native tool turn. Not an error and not empty
+            # output -- it is the model doing exactly what it was asked.
+            self._log(trace, "llm", tag,
+                      f"{data.get('model', model)} -> tool_call "
+                      f"{(tool_calls[0].get('function') or {}).get('name')}",
+                      t0, tokens=usage.get("total_tokens"))
+            return {"text": "", "usage": usage, "model": data.get("model", model),
+                    "choices": data.get("choices") or [], "tool_calls": tool_calls}
+
         if not text:
-            # Reasoning models can burn the entire budget on hidden reasoning and
-            # return empty content. That is a token-budget fault, not a wire fault.
+            # Reasoning models (gpt-oss, o-series) spend part of `max_tokens` on
+            # hidden reasoning. A tight budget -- the router asks for 120 tokens to
+            # pick one of three words -- can be spent ENTIRELY on reasoning, leaving
+            # nothing to say. The endpoint returns 200 with empty content and no
+            # error, so this is indistinguishable from a model that chose to say
+            # nothing.
+            #
+            # `complete` catches this specifically and retries once with 4x, which is
+            # what makes a reasoning model usable as a router. Measured on gpt-oss-20b:
+            # 2498 of 2500 tokens on reasoning produced nothing at all.
+            spent = int(reasoning or 0)
             self._log(trace, "llm", tag, "empty content", t0, status="error")
-            raise LLMUnavailable(
+            raise LLMReasoningExhausted(
                 f"empty response from {model} at max_tokens={max_tokens_for(payload)}"
-                + (f" (reasoning_tokens={reasoning})" if reasoning else "")
-                + " -- raise max_tokens, or use a non-reasoning model.")
+                + (f" (reasoning_tokens={spent})" if spent else "")
+                + " -- raise max_tokens, set LLM_REASONING_EFFORT=low, or use a "
+                  "non-reasoning model.")
         self._log(trace, "llm", tag, f"{data.get('model', model)} -> {len(text)} chars",
                   t0, tokens=usage.get("total_tokens"))
-        return {"text": text, "usage": usage, "model": data.get("model", model)}
+        return {"text": text, "usage": usage, "model": data.get("model", model),
+                "choices": data.get("choices") or []}
 
     def discover(self, base_url: str, key: str | None) -> list[str]:
         """Instance form, so `self` is available. See the module-level function."""
@@ -214,7 +274,18 @@ class HTTPProvider:
         return [m for m in models if m]
 
     def complete(self, messages: list[dict], *, temperature: float | None = None,
-                 max_tokens: int | None = None, trace: Trace | None = None) -> dict:
+                 max_tokens: int | None = None, trace: Trace | None = None,
+                 tools: list[dict] | None = None) -> dict:
+        """One chat completion.
+
+        `tools` sends a native `tools` array. This is not optional decoration: a
+        tool-calling model (gpt-oss and friends) REFUSES a request that describes
+        running things but supplies no tools -- "HTTP 400: Tool choice is none, but
+        model called a tool" -- and no payload flag works around it (`tools: []` and
+        `tool_choice: "none"` were both tried and both returned the same 400). So when
+        the loop wants a structured turn it gives the model real tools rather than
+        asking nicely in prose.
+        """
         base = self.config.base_url
         self.egress.check_url(base)
         self.egress.check_text("\n".join(str(m.get("content", "")) for m in messages))
@@ -232,19 +303,64 @@ class HTTPProvider:
 
         limit = max_tokens or self.config.max_tokens
         temp = self.config.temperature if temperature is None else temperature
-        transient: list[str] = []
-        for model in models:
+        # One reasoning-token retry, tracked here rather than in `_post` because
+        # `_post` does not have `messages` -- the retry has to resend the same
+        # conversation, and the first attempt at this threw a NameError on `base`
+        # precisely because it tried to recurse from the wrong layer.
+        #
+        # The multiplier also grows on a 429, because retrying a rate limit
+        # immediately gets another rate limit. Retrying at the same instant is how a
+        # loop turns one 429 into twenty and makes the limit worse.
+        backoff = float(_env_backoff())
+        for attempt, mult in enumerate((1, 4, 1, 1)):
             try:
-                return self._post(base, model, key,
-                                  {"model": model, "messages": messages,
-                                   "temperature": temp, "max_tokens": limit},
-                                  trace, model)
+                body = {"model": models[0], "messages": messages,
+                        "temperature": temp, "max_tokens": limit * mult}
+                if tools:
+                    body["tools"] = tools
+                    body["tool_choice"] = "auto"
+                # Sent only when configured, and only for a model that accepts them.
+                # `reasoning_format` in particular is Groq-specific and a strict
+                # OpenAI-compatible endpoint rejects unknown fields with a 400, so
+                # this is opt-out rather than always-on.
+                if self.config.reasoning_effort:
+                    body["reasoning_effort"] = self.config.reasoning_effort
+                if self.config.reasoning_format and tools:
+                    body["reasoning_format"] = self.config.reasoning_format
+                return self._post(base, models[0], key, body, trace, models[0])
+            except LLMReasoningExhausted as e:
+                if attempt >= 1:
+                    raise LLMUnavailable(
+                        f"{e} (already retried with 4x the token budget)")
+                self._log(trace, "llm", "retry",
+                          f"{e} -- retrying with {limit * 4} max_tokens", None,
+                          status="retry")
+                continue
             except LLMConfigError:
                 raise                      # a config fault is not worth retrying
             except LLMUnavailable as e:
-                transient.append(f"{model}: {e}")
-        raise LLMUnavailable(
-            "all candidate models failed -> " + " | ".join(transient))
+                # Transient. Wait before retrying, then retry the SAME model (a
+                # malformed tool call and a 429 are both sampling/rate artefacts, and
+                # a fresh sample or a second of patience usually works), then fall
+                # back to the next configured model.
+                #
+                # The sleep is the point. Without it the loop turned one 429 into
+                # twenty requests in under a second, which deepens the rate limit it
+                # was responding to.
+                if "429" in str(e) or "rate limited" in str(e).lower():
+                    time.sleep(backoff * (attempt + 1))
+                if attempt >= 1:
+                    if len(models) > 1:
+                        models = models[1:]
+                        self._log(trace, "llm", "retry",
+                                  f"{e} -- falling back to {models[0]}", None,
+                                  status="retry")
+                        continue
+                    raise
+                self._log(trace, "llm", "retry", f"{e} -- retrying", None,
+                          status="retry")
+                continue
+        raise LLMUnavailable("all candidate models failed")
 
     @staticmethod
     def _log(trace: Trace | None, kind: str, action: str, detail: str, t0: float,
@@ -258,6 +374,35 @@ def max_tokens_for(payload: dict) -> int:
 
 
 # --------------------------------------------------------------------------- facade
+def _env_backoff() -> float:
+    """Seconds to wait before retrying a rate-limited call.
+
+    Configurable, because the right value depends entirely on the provider's limit
+    and the only person who knows it is whoever set the endpoint.
+    """
+    return float(os.environ.get("JARVIS_LLM_BACKOFF_S") or os.environ.get(
+        "LLM_BACKOFF_S") or "2.0")
+
+
+def _short(body: str | bytes, n: int = 300) -> str:
+    """A provider error body, trimmed to something readable in a trace line.
+
+    These bodies are the single most useful thing in a failure report and the least
+    likely to be seen, because they arrive as one enormous JSON line and get truncated
+    by whatever prints it. The `error.message` field is extracted when present because
+    that is where every provider puts the human-readable part.
+    """
+    text = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
+    try:
+        data = json.loads(text)
+        msg = (data.get("error") or {}).get("message")
+        if isinstance(msg, str) and msg:
+            return msg[:n]
+    except Exception:
+        pass
+    return text[:n].replace("\n", " ")
+
+
 def discover(base_url: str, key: str | None) -> list[str]:
     """Model ids this endpoint actually serves, or [] if it will not say.
 
@@ -290,7 +435,7 @@ def discover(base_url: str, key: str | None) -> list[str]:
 
 def call(ctx: TaskContext, messages: list[dict], *, provider: LLMProvider | None = None,
          temperature: float | None = None, max_tokens: int | None = None,
-         purpose: str = "answer") -> dict:
+         purpose: str = "answer", tools: list[dict] | None = None) -> dict:
     """One LLM call, charged to the task budget.
 
     Charges BEFORE the request so an exhausted budget cannot start a call it cannot
@@ -302,7 +447,7 @@ def call(ctx: TaskContext, messages: list[dict], *, provider: LLMProvider | None
     ctx.charge_llm(0)
     out = prov.complete(messages, temperature=ctx.settings.llm.temperature
                         if temperature is None else temperature,
-                        max_tokens=max_tokens, trace=ctx.trace)
+                        max_tokens=max_tokens, trace=ctx.trace, tools=tools)
     usage = out.get("usage") or {}
     tokens = int(usage.get("total_tokens") or estimate_tokens(out.get("text", "")))
     ctx.counters.tokens += tokens

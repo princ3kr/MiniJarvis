@@ -49,6 +49,10 @@ ESCALATE_ON: frozenset[str] = frozenset({"near_miss", "not_found"})
 
 MAX_RUNG_VISITS = 3
 
+# The ladder's rungs, in escalation order. Used to work out how many stages might
+# still run, so the iteration budget can be divided between them.
+STRATEGY_ORDER: tuple[str, ...] = ("direct", "loop", "plan")
+
 
 @dataclass
 class StageResult:
@@ -119,6 +123,24 @@ def _direct_stage(query: str, *, ctx: TaskContext, use_llm_verify: bool) -> Stag
                        verified=False, cost=cost)
 
 
+def _stage_share(ctx: TaskContext, stages_left: int) -> int:
+    """Iterations this stage may spend, out of the task's remaining budget.
+
+    WITHOUT THIS, escalation is useless. The iteration budget was global, so the first
+    stage spent all of it and every later rung was refused at turn 1 with
+    "iteration ceiling 8 reached" -- the ladder reported `budget` and gave up without
+    ever running the strategy it escalated to. Observed on
+    "how many lines of python are in this directory?": the loop used 8 turns, then
+    plan got none.
+
+    So the budget is DIVIDED among the stages that might still run. Guessing low stays
+    cheap: `direct` costs no iterations at all (it is one tool call), so most of the
+    budget goes to `loop`, which is where turns are actually spent.
+    """
+    remaining = max(1, ctx.budget.max_iterations - ctx.counters.iterations)
+    return max(2, remaining // max(1, stages_left))
+
+
 def _loop_stage(query: str, *, ctx: TaskContext, use_llm_verify: bool,
                 max_turns: int | None = None) -> StageResult:
     """The ReAct loop. Its own result already carries verdicts and a finish check."""
@@ -156,7 +178,7 @@ def _loop_stage(query: str, *, ctx: TaskContext, use_llm_verify: bool,
 
 
 def _plan_stage(query: str, *, ctx: TaskContext, use_llm_verify: bool,
-                replans_left: int) -> StageResult:
+                replans_left: int, turn_cap: int | None = None) -> StageResult:
     """Planner v2: sub-goals, each run by a bounded loop, combined at the end.
 
     The plan says planner steps are sub-goals run by bounded loops, not agent calls.
@@ -164,6 +186,7 @@ def _plan_stage(query: str, *, ctx: TaskContext, use_llm_verify: bool,
     converge is reported as such rather than silently swallowed.
     """
     from .planner import (DSPY_OK, configure_dspy, make_plan, make_plan_fallback)
+    from .react import run_react
 
     t0 = time.perf_counter()
     used_fallback = False
@@ -191,8 +214,12 @@ def _plan_stage(query: str, *, ctx: TaskContext, use_llm_verify: bool,
         # Each step is a SUB-GOAL run by a bounded loop, per the plan. Not an agent
         # call: an agent call cannot escalate, and a sub-goal that needs a command
         # needs the loop.
-        sub = run_react(step.instruction, ctx=ctx,
-                        max_turns=max(3, ctx.budget.max_iterations // 2),
+        #
+        # The cap is this stage's share divided among its steps, so a 3-step plan does
+        # not have its whole budget consumed by step 1 -- which is what happened: step
+        # 2 and 3 were refused at turn 1 with the task budget already spent.
+        per_step = max(2, (turn_cap or ctx.budget.max_iterations) // max(1, len(plan.steps)))
+        sub = run_react(step.instruction, ctx=ctx, max_turns=per_step,
                         use_llm_verify=use_llm_verify)
         tried.append(f"step {step.id} -> {sub.status} ({sub.turns} turns)")
         if sub.answer:
@@ -267,6 +294,13 @@ def plan_path(query: str, *, ctx: TaskContext, strategy: str = "auto",
         if visits.get(current, 0) >= MAX_RUNG_VISITS:
             emit("route", f"{current} tried {MAX_RUNG_VISITS}x, stopping")
             break
+
+        # Rungs not yet visited, INCLUDING this one. Computed BEFORE this rung is
+        # marked visited: after, `visits` already contains it, the count drops to the
+        # number of future rungs, and the current stage is handed the whole remaining
+        # budget -- which is how the loop spent all 8 iterations and left `plan` with
+        # none.
+        rungs_left = sum(1 for k in STRATEGY_ORDER if k not in visits)
         visits[current] = visits.get(current, 0) + 1
 
         emit("stage", f"running {current}")
@@ -274,11 +308,14 @@ def plan_path(query: str, *, ctx: TaskContext, strategy: str = "auto",
             if current == "direct":
                 res = _direct_stage(query, ctx=ctx, use_llm_verify=use_llm_verify)
             elif current == "loop":
+                turn_cap = max_turns if max_turns is not None else _stage_share(ctx, rungs_left)
                 res = _loop_stage(query, ctx=ctx, use_llm_verify=use_llm_verify,
-                                  max_turns=max_turns)
+                                  max_turns=turn_cap)
             elif current == "plan":
                 res = _plan_stage(query, ctx=ctx, use_llm_verify=use_llm_verify,
-                                  replans_left=replans_left)
+                                  replans_left=replans_left,
+                                  turn_cap=max_turns if max_turns is not None
+                                  else _stage_share(ctx, rungs_left))
             else:
                 raise ValueError(f"unknown strategy {current!r}")
         except BudgetExhausted as e:
@@ -330,6 +367,37 @@ def plan_path(query: str, *, ctx: TaskContext, strategy: str = "auto",
 
 
 # --------------------------------------------------------------------------- verify
+# Phrases that mean "I did not find it". An answer containing one is NOT an answer,
+# however well it is formatted and whatever the rubric said.
+#
+# Here because the rubric is not enough. Asked how many lines of Python were in a
+# directory, the model produced a clean, confident, well-formed paragraph that opened
+# "I don't have the line-count information for any of the listed files" -- and the
+# pipeline printed it under a green ANSWER heading. It passed every path check (no
+# paths), every number check (no numbers), and the rubric, because it IS a truthful
+# sentence about the evidence. Being honest about failing is not the same as having
+# succeeded, and only the wording distinguished them.
+#
+# Deliberately a short list of unambiguous admissions rather than sentiment analysis.
+# A false positive costs one loop turn; a false negative shows a refusal to a user who
+# asked a question, dressed as an answer.
+_ADMISSIONS = (
+    "i don't have", "i do not have", "i couldn't", "i could not",
+    "i wasn't able", "i was not able", "unable to find", "unable to determine",
+    "not able to find", "not able to determine", "cannot find", "cannot determine",
+    "no information", "not enough information", "insufficient information",
+    "no results", "no matches", "not found", "couldn't find", "could not find",
+    "i'm unable", "i am unable", "no answer", "cannot answer", "can't answer",
+    "i don't know", "i do not know",
+)
+
+
+def admits_failure(text: str) -> bool:
+    """Does this answer say it could not find the answer?"""
+    low = " ".join((text or "").lower().replace("’", "'").split())
+    return any(p in low for p in _ADMISSIONS)
+
+
 def synthesize_verified(query: str, candidate: str, evidence: list[dict],
                         *, ctx: TaskContext, use_llm_verify: bool = True
                         ) -> tuple[str | None, str]:
@@ -350,6 +418,13 @@ def synthesize_verified(query: str, candidate: str, evidence: list[dict],
     corpus = "\n".join(str(e.get("output") or "") for e in evidence)
     if not corpus:
         return None, "no evidence to verify against"
+
+    # --- code first, and before anything else: is this an answer at all?
+    # An admission of failure is a `not_found`, not a result. Checked here so it
+    # cannot be reached by a rubric that is feeling generous.
+    if admits_failure(candidate):
+        return None, ("answer admits it could not find the information; that is a "
+                      "not-found, not an answer")
 
     # --- code first: numbers
     bad = _unsupported_numbers(candidate, corpus)

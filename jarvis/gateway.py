@@ -50,11 +50,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from .access import AccessDenied, AccessPolicy
+from .access import SECRET_DIRS, AccessDenied, AccessPolicy
 from .config import Settings, load_settings
 from .context import TaskContext, new_task
 from .manifests import build_manifests
 from .policy import CommandSpec, PolicyVerdict, Tier, classify
+from .prune import inject
 from .runner import ProcessResult, argv_preview, run_process
 
 __all__ = ["Gateway", "CommandResult", "CheckResult", "authorize", "execute",
@@ -224,8 +225,36 @@ def execute(spec: CommandSpec, manifest, *, ctx: TaskContext, approve: bool = Fa
 
     before = _snapshot_paths(cwd) if int(verdict.tier) >= 1 else None
 
+    # The policy INJECTS the deny-list exclusions into a recursive command. This runs
+    # AFTER authorization on purpose: a command that was going to be refused is still
+    # refused, so the rewrite can only ever narrow what reaches the filesystem. The
+    # model was asked to add these exclusions itself and got them wrong three times in
+    # a row -- `-not -path */.ssh/*` is not a form the grammar accepts -- so it is the
+    # policy's job, not the model's.
+    #
+    # The POST-rewrite argv is what runs and what the trace records. Logging the
+    # model's version would make the trace a description of a command nobody ran.
+    real_argv = inject(spec.argv, access=policy)
+    injected = real_argv != list(spec.argv)
+    if injected:
+        ctx.log("gateway", "inject",
+                detail=f"added {len(real_argv) - len(spec.argv)} exclusion arg(s)",
+                status="ok", argv=real_argv)
+
+    # Fail closed if the injection did not do its job. The guarantee is now "the walk
+    # that runs excludes the secrets", and this is where that is actually true or
+    # false. A binary with no way to express the exclusion (`cp -r`) reaches here with
+    # nothing added, so this has to be able to say no.
+    leaked = _unpruned(real_argv)
+    if leaked:
+        reason = (f"{' '.join(real_argv)} walks but cannot exclude deny-listed "
+                  f"directories: {', '.join(leaked)}")
+        ctx.log("gateway", "execute", detail=reason, status="denied", t0=t0)
+        return CommandResult(status="denied", argv=list(real_argv), cwd=str(cwd),
+                             tier=int(verdict.tier), reason=reason)
+
     proc: ProcessResult = run_process(
-        spec.argv, cwd=cwd, timeout_s=limit_s,
+        real_argv, cwd=cwd, timeout_s=limit_s,
         max_output_bytes=int(manifest.limits.max_output_bytes),
         limits=s.limits, expect_exit=spec.expected_exit)
 
@@ -248,12 +277,13 @@ def execute(spec: CommandSpec, manifest, *, ctx: TaskContext, approve: bool = Fa
     if status == "ok" and changed and not set(spec.expected_effects) & set(changed):
         reason = f"exit 0 but undeclared files changed: {changed[:3]}"
 
+    # `real_argv`, not `spec.argv`. What ran is what the trace shows.
     ctx.log("gateway", "execute",
-            detail=f"{status} {argv_preview(spec.argv)}", status=status, t0=t0,
-            exit_code=proc.exit_code, truncated=proc.truncated)
+            detail=f"{status} {argv_preview(real_argv)}", status=status, t0=t0,
+            exit_code=proc.exit_code, truncated=proc.truncated, argv=list(real_argv))
 
     return CommandResult(
-        status=status, argv=list(spec.argv), cwd=str(cwd), tier=int(verdict.tier),
+        status=status, argv=list(real_argv), cwd=str(cwd), tier=int(verdict.tier),
         exit_code=proc.exit_code, duration_ms=proc.duration_ms,
         stdout_tail=proc.stdout[-4000:], stderr_tail=proc.stderr[-4000:],
         timed_out=proc.timed_out, changed_files=changed, truncated=proc.truncated,
@@ -309,6 +339,27 @@ def run_postconditions(spec: CommandSpec, cwd: Path, *, proc: ProcessResult,
             out.append(CheckResult(c.kind, c.value, False,
                                    f"{type(e).__name__}: {str(e)[:40]}"))
     return out
+
+
+def _unpruned(argv: list[str]) -> list[str]:
+    """Secret directory names this argv does NOT exclude, if it walks.
+
+    Runs on the POST-INJECTION argv. This is the actual guarantee: not "the model asked
+    nicely", but "the command that is about to run cannot descend into `.ssh`". It
+    re-derives the names rather than trusting `inject` to have appended them, because a
+    guarantee that is checked by the same function that implements it is not a check.
+
+    Returns [] for a non-walking command, and for a walk whose every name is covered.
+    """
+    from .prune import is_recursive
+
+    if not argv:
+        return []
+    binary = argv[0].rsplit("/", 1)[-1]
+    if not is_recursive(binary, argv):
+        return []
+    joined = " ".join(argv)
+    return [d for d in sorted(SECRET_DIRS) if d not in joined]
 
 
 # --------------------------------------------------------------------------- change detect

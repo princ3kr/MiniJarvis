@@ -1330,13 +1330,18 @@ def classify(spec: CommandSpec, manifest, *, access: AccessPolicy,
             reasons.append(f"env wraps {inner.binary} (tier {int(inner.tier)})")
             reasons.extend(inner.reasons)
 
-    # 5b. recursion into deny-listed directories. Path operands can be in scope and
-    #     the walk still reaches a secret, so this is checked before the grammar
-    #     result is used, not after.
-    ok, detail = _check_recursion(binary, argv, access)
-    if not ok:
-        return PolicyVerdict(tier=Tier.DENIED, reason=detail, binary=binary,
-                             binary_resolved=binary_path, reasons=[detail])
+    # 5b. Recursion into deny-listed directories.
+    #
+    # This used to DENY any recursive command that did not itself carry the
+    # exclusions, which was correct and made the agent useless: it required the model
+    # to know a list of secret directories it cannot discover, and the loop spent
+    # three turns trying `-not -path */.ssh/*` before the budget ran out. The policy
+    # now INJECTS them (`jarvis.prune.inject`) and the gateway asserts the result, so
+    # the guarantee holds at the point where it is satisfied rather than being
+    # demanded of the caller.
+    #
+    # The check remains available for a caller that wants to assert compliance without
+    # going through the gateway -- but it is no longer on the hot path.
 
     if binary == "find":
         danger, detail = _has_dangerous_find_flag(argv)

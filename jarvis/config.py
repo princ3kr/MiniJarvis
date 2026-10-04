@@ -238,6 +238,21 @@ class LLMConfig:
     timeout_s: int = 60
     temperature: float = 0.0
     max_tokens: int = 900
+    # Reasoning models (gpt-oss, o-series) spend `max_tokens` on hidden reasoning
+    # BEFORE producing content or a tool call. At the default budget a loop turn is
+    # spent entirely on reasoning and returns HTTP 200 with empty content -- which is
+    # indistinguishable from a model that chose to say nothing.
+    #
+    # Measured on gpt-oss-20b: with the default, a single turn consumed 2498 of 2500
+    # tokens on reasoning and produced no call. With `low` it used 35 and called the
+    # tool immediately. So this is not a cost knob, it is a correctness knob: a
+    # reasoning model with too much thinking time produces no output at all.
+    #
+    # None means "do not send the field", which is right for a model that rejects it.
+    reasoning_effort: str | None = "low"
+    # Return the model's visible reasoning. Useful in the trace for auditing WHY it
+    # ran a command; costs nothing extra in tokens.
+    reasoning_format: str | None = "parsed"
     # Fallbacks are tried in order when a call fails transiently. The comment that
     # used to sit here -- that Groq's daily limit is per-model, so a fallback must
     # stay on the same model -- was about one provider and no longer described what
@@ -319,9 +334,18 @@ def load_settings(**overrides) -> Settings:
     value even if the developer's shell says otherwise.
     """
     env_budget = Budget(
-        max_llm_calls=int(_env("JARVIS_MAX_LLM_CALLS", "12")),
+        # 40, not 12. Each loop turn costs TWO calls -- decide, then judge the
+        # observation -- plus one for the router and one for synthesis. A total of 12
+        # is six turns across the WHOLE ladder including escalation, which ran out
+        # mid-conversation ("llm call ceiling 12 reached") and made every escalation
+        # look like a budget bug rather than a budget.
+        max_llm_calls=int(_env("JARVIS_MAX_LLM_CALLS", "40")),
         max_tool_calls=int(_env("JARVIS_MAX_TOOL_CALLS", "40")),
-        max_iterations=int(_env("JARVIS_MAX_ITERATIONS", "8")),
+        # 16, not 8. The budget is DIVIDED across the ladder's stages, so a total of 8
+        # gives `loop` four turns and leaves `plan` nothing -- every escalated stage
+        # was refused at turn 1 with "iteration ceiling 8 reached", which reads as a
+        # broken budget rather than as a division that was too aggressive to be useful.
+        max_iterations=int(_env("JARVIS_MAX_ITERATIONS", "16")),
         max_tokens=int(_env("JARVIS_MAX_TOKENS", "200000")),
         wall_clock_s=float(_env("JARVIS_WALL_CLOCK_S", "300")),
         max_replans=int(_env("JARVIS_MAX_REPLANS", "2")),
@@ -340,6 +364,8 @@ def load_settings(**overrides) -> Settings:
         timeout_s=int(_env("LLM_TIMEOUT_S", "60")),
         temperature=float(_env("LLM_TEMPERATURE", "0.0")),
         max_tokens=int(_env("LLM_MAX_TOKENS", "1500")),
+        reasoning_effort=_env("LLM_REASONING_EFFORT", "low"),
+        reasoning_format=_env("LLM_REASONING_FORMAT", "parsed"),
         fallback_models=tuple(
             m.strip() for m in (_env("LLM_FALLBACK_MODELS") or "").split(",") if m.strip()),
     )
