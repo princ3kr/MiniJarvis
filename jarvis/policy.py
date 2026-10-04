@@ -17,6 +17,8 @@ from typing import Any, Callable, Literal, Optional, Tuple
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .access import SECRET_DIRS, AccessDenied, AccessPolicy
+from .frozen import tiers as _frozen_tiers
+from .frozen.tiers import INTERPRETERS, TIER1_FLOOR, TIER2_FLOOR
 from .context import TaskContext  # for reference
 from .redaction import redact
 
@@ -1006,16 +1008,13 @@ _ALWAYS_DESCEND = frozenset({"find", "du", "tree", "tar"})
 # optional, and it is short enough to state in one error message. `node_modules`
 # being walkable is the jail's noise policy, not this rule's business -- exactly the
 # walkable-vs-nameable distinction `access.py` draws.
-_ALWAYS_PRUNE_DIRS = tuple(sorted(SECRET_DIRS))
-
-
 def _required_exclusions(access: AccessPolicy) -> set[str]:
-    # `access` is still a parameter and is still used: deny_globs can be extended at
-    # runtime via Settings, and a caller who adds a secret directory there should get
-    # it enforced here too without editing the policy module.
-    return set(_ALWAYS_PRUNE_DIRS) | {
-        Path(g).name for g in access.deny_globs
-        if Path(g).name and "*" not in Path(g).name and Path(g).name in SECRET_DIRS}
+    """Delegates to `frozen.tiers` so there is ONE list of secret directories.
+
+    Two lists drift, and a directory that is secret in one place and noise in the other
+    becomes a hole with a comment explaining why it is fine.
+    """
+    return _frozen_tiers.required_exclusions(access)
 
 
 def _check_recursion(binary: str, argv: list[str], access: AccessPolicy) -> tuple[bool, str]:
@@ -1240,7 +1239,7 @@ _DANGEROUS_ENV_KEYS = {
 
 
 def classify(spec: CommandSpec, manifest, *, access: AccessPolicy,
-             _depth: int = 0) -> PolicyVerdict:
+             _depth: int = 0, settings=None) -> PolicyVerdict:
     """Decide the risk tier for one command. Fails closed.
 
     `access` is a REQUIRED keyword argument, not an optional default. Policy cannot
@@ -1486,7 +1485,11 @@ def classify(spec: CommandSpec, manifest, *, access: AccessPolicy,
         reasons.append("tainted argv, but tier 0 cannot write or execute")
 
     # 12. tier floor. A clean grammar does not make a writer read-only.
-    tier = apply_tier_floor(binary, tier, reasons)
+    #
+    # `settings` is threaded rather than read from a module global so "is the frozen
+    # tier machinery reachable" is a per-call question with a per-call answer. Reading
+    # it from a global would reintroduce exactly the coupling the plan forbids.
+    tier = _frozen_tiers.apply(settings, binary, tier, reasons)
     if wrapper_tier is not None:
         tier = max(tier, wrapper_tier)
 
@@ -1514,37 +1517,3 @@ ALWAYS_DENIED = {
     "iptables", "ufw", "swapoff", "fdisk", "parted", "mkfs.ext4",
 }
 
-# ---------------------------------------------------------------------------
-# Tier floors.
-# ---------------------------------------------------------------------------
-# A grammar says which FLAGS are acceptable. It says nothing about what the binary
-# DOES when the flags are fine, so a read-only grammar alone will happily classify
-# `tar -cf out.tar /home` as tier 0 -- which it is, flag-wise, and categorically is
-# not. The notebook expressed this as a tier in the same table as the flag
-# validator; the grammar split lost it, so it is restored here as an explicit floor.
-#
-# Tier 1 = writes inside the workspace, reversible by snapshot.
-# Tier 2 = builds or fetches, which is where network and package managers live.
-TIER1_FLOOR = {
-    "mkdir", "touch", "cp", "mv", "ln", "tar", "unzip", "zip", "install", "patch",
-}
-TIER2_FLOOR = {
-    "awk", "make", "cmake", "ninja", "cargo", "go", "java", "javac", "gradle",
-    "mvn", "pip", "pip3", "npm", "npx", "yarn", "pnpm", "apt", "apt-get", "dnf",
-    "yum", "pacman", "brew", "rsync", "screen", "tmux", "gdb", "strace",
-}
-
-
-def apply_tier_floor(binary: str, tier: Tier, reasons: list[str]) -> Tier:
-    """Raise `tier` to the floor for `binary`. Never lowers it."""
-    if binary in TIER2_FLOOR:
-        if int(tier) < int(Tier.APPROVAL):
-            reasons.append(f"{binary} builds or fetches -> tier 2 minimum")
-            return Tier.APPROVAL
-        return tier
-    if binary in TIER1_FLOOR:
-        if int(tier) < int(Tier.REVERSIBLE):
-            reasons.append(f"{binary} writes -> tier 1 minimum")
-            return Tier.REVERSIBLE
-        return tier
-    return tier

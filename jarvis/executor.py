@@ -297,4 +297,4 @@ def executor_manifest(settings, roots=None) -> AgentManifest:
     Raising it is a deliberate edit to this line and to `executor_enabled_tier`.
     """
     r = roots or tuple(str(x) for x in settings.read_roots)
-    return build_manifests(r, str(settings.write_root))["executor"]
+    return build_manifests(r, str(settings.write_root))["loop"]

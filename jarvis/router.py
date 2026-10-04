@@ -1,63 +1,202 @@
-"""The router: cheap lexical classification of a query into a SHAPE and an INTENT.
+"""The router: ONE LLM call decides direct | loop | plan.
 
-Two decisions live here, and they are deliberately different in kind:
+This replaces a regex cue list, which the design explicitly called out for removal.
+The first version of this file was `PLAN_NEEDED_CUES` matched with `in` against the
+lowercased query. It had two failures, and the second is why the gate was a trap:
 
-  * `detect_query_type` -- AGGREGATE ("how many images?") vs LOCATE ("where is X?").
-    An aggregate question must COUNT the tree, not pattern-match a folder name.
-    That distinction was a real fix: "how many images" used to match folders
-    literally named `images`.
-  * `needs_plan` -- whether a task is multi-step. This is the broken gate. See its
-    comment; it is kept verbatim so Phase 1 can remove it against a test.
+* substrings misfire -- `"both"` matches any query containing those four letters
+* **no cue could ever select the loop**, so `strategy="auto"` had two reachable paths
+  out of three. A diagnostic question got a one-shot file search and a confident
+  wrong answer, and every query looked identical in the trace.
 
-There is also the intent extractor, which turns a natural-language query into
-`filenames` + `keywords`. That lives here rather than in `agents.py` because the
-router is the only consumer that needs it before an agent is chosen, and because
-the STOPWORDS list is a routing concern: it exists to stop a PLANNER's prose
-("Search the codebase for the definition of X") from leaking `search`/`codebase`/
-`definition` into keywords, which then fuzzy-match every `src/` on disk.
+Why a model and not a smarter function
+--------------------------------------
+Because the decision is not lexical. It is about *what kind of work settles the
+question*, and no word list captures that:
+
+    "which file is >= 100MB"        needs `find -size`, i.e. a command
+    "how many images are there"     one tool call
+    "compare a.py and b.py"         two searches and a join
+
+The first and third differ by one word ("which file is >= 100MB" vs "which files are
+images"), and a cue list that separated them would be a coincidence. A model reads the
+question and picks the tool that can answer it, which is the actual skill.
+
+Why ONE call
+------------
+One, before any work. Not a call per stage, and not a call per candidate. The router
+is a cost, and a router that costs more than the work it routes is not worth having.
+If the choice is wrong the ladder recovers -- `escalate` moves direct -> loop -> plan
+when a stage returns `not_found` -- so the router only has to be right most of the
+time, not always. That is why it can be a single cheap call with no retry.
+
+`plan` is for MULTI-PART tasks only. Anything a bounded loop can converge on is
+`loop`, because a loop that escalates itself is strictly better than a plan that
+guesses the decomposition up front.
+
+Fallback
+--------
+If the model is unreachable -- no key, no endpoint, 401 -- `route()` returns `loop`.
+Not `direct`: `loop` is the only rung whose failures are self-correcting, and a
+degraded router should pick the path that verifies its own work. The regex cue list
+is gone entirely rather than kept as a fallback, because a fallback nobody trusts is
+a fallback that will be the primary path the first time the API is slow.
 """
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any
+from typing import Literal
 
-from .context import TaskContext
+from . import llm
+from .context import BudgetExhausted, TaskContext
+from .llm import LLMConfigError, LLMUnavailable
 
-# The one spelling of the agent's name. The prompt bundle stamps it on every
-# bundle so a trace can be traced back to which agent produced the evidence.
-AGENT_NAME_LITERAL = "searchFiles"
+Strategy = Literal["direct", "loop", "plan"]
+STRATEGIES: tuple[str, ...] = ("direct", "loop", "plan")
+
+# `plan` -> `loop` -> `direct` is the escalation ORDER for RETRIES. A plan that cannot
+# be decomposed into steps is better served by a loop, and a loop that cannot converge
+# is better served by a plan that thinks first. `direct` is last because it is the
+# rung most likely to produce a confident wrong answer.
+ESCALATION: dict[str, str] = {"direct": "loop", "loop": "plan", "plan": "loop"}
+
+JUDGE_PROMPT = """\
+You route a filesystem question to the cheapest strategy that can answer it.
+
+You are NOT answering the question. You are choosing who does.
+
+STRATEGIES
+
+direct
+  One cheap tool call: find, grep, read, survey, index_query. Nothing else.
+  Use it ONLY when one of those calls plainly settles the question.
+  "how many python files are under src/", "where is X defined",
+  "does a file called notes.txt exist".
+
+loop
+  Run shell commands in a loop: pick a command, see its output, decide the next one,
+  until the answer is supported by what the commands actually printed.
+  Use it for anything where the answer IS command output, or where no single tool
+  call is enough:
+    - SIZE or TIME: "which file is >= 100MB", "how much disk space", "how old",
+      "what is the size of X", "what changed recently"
+    - COUNTS WITH CONDITIONS: "how many files are >= 100MB", "how many images are
+      larger than 2MB", "how many lines of python are there"
+    - "the system" / "my machine" / "everywhere": a scope wider than one directory,
+      which needs find/du/df rather than a single directory listing
+    - anything needing output you cannot see without running something
+    - diagnostics: "why does X fail", "what is the error"
+
+plan
+  Decompose a genuinely MULTI-PART task into sub-goals, run them, combine the
+  results. Use it only when the question has two or more INDEPENDENT parts that each
+  need their own investigation:
+    "compare a.py and b.py and tell me which is more readable"
+    "find my resume, summarize it, and also check if there is a cover letter"
+    "how much disk is Downloads and separately how much is Documents"
+  If ONE loop could converge on it, choose loop. A loop that escalates itself beats
+  a plan that guesses the decomposition.
+
+TIE-BREAK, in order:
+  1. If the answer depends on something you can only get by RUNNING something, loop.
+  2. If one tool call settles it, direct.
+  3. If it has two or more independent parts, plan.
+  4. Otherwise loop. A loop that escalates is safer than a one-shot guess.
+
+Reply with ONE JSON object and nothing else:
+{"strategy": "direct|loop|plan", "reason": "under 15 words"}"""
 
 
-# --------------------------------------------------------------------------- plan gate
-# KNOWN BUG (removal scheduled, Phase 1): PLAN_NEEDED_CUES is matched as SUBSTRINGS,
-# not as phrases. `"both"` matches "both files and folders", which is fine, but it also
-# matches a single-file query that merely contains those letters; more importantly there
-# is no cue that can ever select the ReAct path, so the ReAct loop is unreachable from
-# `run_task(strategy="auto")`. Phase 1 replaces this whole gate with a DSPy classifier
-# plus an escalation ladder (direct -> discovery -> plan -> react). Kept for Phase 0
-# fidelity: several notebook regressions encode the CURRENT decision boundary.
-PLAN_NEEDED_CUES = ("then", "and also", "after that", "compare", "compare them",
-                    "both", "across", "summarize", "summarise", "then find",
-                    "and count", "and report", "step by step")
+@dataclass(frozen=True)
+class Route:
+    strategy: Strategy
+    reason: str
+    source: str = "llm"          # "llm" | "fallback"
+    cost: float = 0.0
+
+    @property
+    def escalate_to(self) -> str | None:
+        """The next rung on failure, or None to give up. `plan` retries as `loop`
+        rather than stopping, because an undecomposable plan is a loop's problem."""
+        return ESCALATION.get(self.strategy)
 
 
-def needs_plan(query: str, *, ctx: TaskContext | None = None) -> tuple[bool, str]:
-    """Cheap gate. Logged so the threshold can be tuned from data later.
+def route(query: str, *, ctx: TaskContext | None = None) -> Route:
+    """One model call. Never raises, and always returns a usable strategy."""
+    q = query.strip()
+    try:
+        out = llm.call(ctx, [{"role": "system", "content": JUDGE_PROMPT},
+                             {"role": "user", "content": q}],
+                       purpose="route", temperature=0.0, max_tokens=120)
+        cost = float(out.get("usage", {}).get("total_tokens") or 0)
+        data = llm.extract_json(out.get("text", ""), expect="object")
+        strategy = str(data.get("strategy") or "").strip().lower()
+        reason = str(data.get("reason") or "").strip()[:120]
+    except llm.LLMUnavailable as e:
+        # Degraded, not broken. `loop` because it is the only rung that verifies its
+        # own work: escalating on `not_found` means a wrong router still converges.
+        if ctx is not None:
+            ctx.log("route", "judge", detail=f"llm unavailable: {e}", status="fallback",
+                    strategy="loop", reason="llm unavailable", tool="router")
+        return Route("loop", f"llm unavailable ({type(e).__name__}); defaulting to loop",
+                     source="fallback")
+    except BudgetExhausted as e:
+        if ctx is not None:
+            ctx.log("route", "judge", detail=f"budget: {e}", status="budget",
+                    strategy="loop", reason="budget exhausted", tool="router")
+        return Route("loop", "budget exhausted before routing", source="fallback")
+    except LLMConfigError as e:
+        # A CONFIG error is not a transient one. Degrading to a loop would paper over
+        # "no API key" with an agent that appears to work and cannot answer, which is
+        # the worst possible failure mode for diagnosing it. Say so loudly and still
+        # return something runnable.
+        if ctx is not None:
+            ctx.log("route", "judge", detail=str(e)[:120], status="config_error",
+                    strategy="loop", reason="llm misconfigured", tool="router")
+        return Route("loop", f"LLM CONFIG ERROR: {e}", source="fallback")
+    except Exception as e:
+        if ctx is not None:
+            ctx.log("route", "judge", detail=f"{type(e).__name__}: {str(e)[:60]}",
+                    status="error", strategy="loop", reason="router error",
+                    tool="router")
+        return Route("loop", f"router error ({type(e).__name__}); defaulting to loop",
+                     source="fallback")
 
-    KNOWN BUG (removal scheduled, Phase 1): substring cues misfire -- "both" matches
-    any query containing that substring, and this gate never selects the ReAct path at
-    all. Replaced by a DSPy classifier plus an escalation ladder. Kept for Phase 0
-    fidelity.
-    """
-    q = query.lower()
-    cue = next((c for c in PLAN_NEEDED_CUES if c in q), None)
-    multi = len(re.findall(r"[a-z_]+\.(?:py|md|ipynb|json|yaml|txt)", q)) >= 2
-    decision = bool(cue) or multi
-    reason = f"cue={cue!r}" if cue else ("multiple files named" if multi else "single-step")
+    if strategy not in STRATEGIES:
+        # A model that names a strategy that does not exist has not answered the
+        # question. Treat it as unusable rather than coercing it: coercing would let
+        # a typo silently pick a rung.
+        if ctx is not None:
+            ctx.log("route", "judge", detail=f"bad strategy {strategy!r}",
+                    status="error", strategy="loop", reason="unrecognised strategy",
+                    tool="router")
+        return Route("loop", f"unrecognised strategy {strategy!r}; defaulting to loop",
+                     source="fallback", cost=cost)
+
     if ctx is not None:
-        ctx.log("route", "gate", detail=f"needs_plan={decision} ({reason})", status="ok",
-                decision=decision, reason=reason, tool="router")
-    return decision, reason
+        ctx.log("route", "judge", detail=f"{strategy} ({reason})", status="ok",
+                strategy=strategy, reason=reason, source="llm", tool="router")
+    return Route(strategy, reason or "(no reason given)", source="llm", cost=cost)
+
+
+# Imported late: context imports this module, so a top-level import would be circular.
+from .context import BudgetExhausted  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# FAST PATH -- exact lookups. Not a router.
+#
+# Everything below decides what a `direct` call should LOOK FOR, not which strategy
+# to use. The strategy is `route()` above, which is a model call. Keeping these two
+# concerns in one file but two clearly separated halves is deliberate: the plan
+# removes the regex router, not the cheap exact-match fast path, and conflating them
+# is how the cue list came to be load-bearing in the first place.
+#
+# Nothing here may influence strategy selection. `detect_query_type` in particular
+# used to gate `needs_plan` and that is exactly the coupling being removed.
+# ---------------------------------------------------------------------------
+AGENT_NAME_LITERAL = "searchFiles"
 
 
 # --------------------------------------------------------------------------- categories
@@ -171,6 +310,7 @@ def extract_intent(query: str) -> dict[str, Any]:
             "raw": query}
 
 
-__all__ = ["AGENT_NAME_LITERAL", "PLAN_NEEDED_CUES", "CATEGORY_WORDS", "AGGREGATE_CUES",
+__all__ = ["route", "Route", "STRATEGIES", "ESCALATION", "JUDGE_PROMPT",
+           "AGENT_NAME_LITERAL", "CATEGORY_WORDS", "AGGREGATE_CUES",
            "FILENAME_EXTS", "FILENAME_RE", "BARE_FILENAME_RE", "STOPWORDS",
-           "needs_plan", "detect_query_type", "extract_intent"]
+           "detect_query_type", "extract_intent"]

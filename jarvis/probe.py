@@ -129,7 +129,11 @@ def section_classify(ws: str, home: str, manifest, policy: AccessPolicy) -> None
         ("control: ls", ["ls", "-la"], None, "T0"),
         ("control: git status", ["git", "status"], None, "T0"),
         ("control: python3 --version", ["python3", "--version"], None, "T0"),
-        ("control: touch inside workspace", ["touch", f"{ws}/_p.txt"], None, "T1"),
+        # Writers are FROZEN. They classify at tier 1 but are refused by the ceiling
+        # and by the frozen package, so the expectation is DENY -- not T1. Expecting T1
+        # here reported PERMISSIVE for the correct behaviour, which is how a probe
+        # starts teaching you to loosen a policy that is working.
+        ("control: touch is frozen", ["touch", f"{ws}/_p.txt"], None, "DENY"),
         ("control: python3 -c (interpreter)", ["python3", "-c", "print(1)"], None, "GE2"),
         ("control: find -exec", ["find", ".", "-exec", "ls", "{}", "+"], None, "DENY"),
         ("control: xargs", ["xargs", "ls"], None, "DENY"),
@@ -166,7 +170,7 @@ def section_classify(ws: str, home: str, manifest, policy: AccessPolicy) -> None
         ("env wrapper around python", ["env", "python3", "x.py"], None, "GE2"),
         # new in this package: bundling and writers
         ("tar -cf (bundled short flags)", ["tar", "-cf", "/tmp/o.tar", ws], None, "GE1"),
-        ("mkdir -p (writer, tier 1)", ["mkdir", "-p", f"{ws}/sub"], None, "T1"),
+        ("mkdir -p is frozen", ["mkdir", "-p", f"{ws}/sub"], None, "DENY"),
     ]
     for label, argv, cwd, expect in cases:
         bare = argv[0] if argv else ""
@@ -210,7 +214,7 @@ def section_gateway(ws: Path, settings, manifests, gw: Gateway) -> None:
     ls = CommandSpec(argv=[str(shutil.which("ls"))], why="probe")
 
     ctx = new_task("probe", settings=settings, root=ws)
-    r = gw.execute(ls, manifests["discovery"], ctx=ctx)
+    r = gw.execute(ls, manifests["searchFiles"], ctx=ctx)
     _record("gateway", "discovery calling run_command",
             "PASS" if r.status == "denied" else "PERMISSIVE",
             f"{r.status}: {r.reason[:50]}")
@@ -219,7 +223,7 @@ def section_gateway(ws: Path, settings, manifests, gw: Gateway) -> None:
         name = "nonexistent_agent"
         tools = ("run_command",)
         max_tier = 3
-        limits = manifests["executor"].limits
+        limits = manifests["loop"].limits
     # An agent name nobody declared must not resolve to anything executable.
     # The notebook tested this by passing a fake manifest; here the property is
     # that the REGISTRY refuses the name, because a manifest constructed ad hoc
@@ -235,17 +239,22 @@ def section_gateway(ws: Path, settings, manifests, gw: Gateway) -> None:
             "registry raised KeyError" if reg_ok else "resolved to something")
 
     ctx3 = new_task("probe", settings=settings, root=ws)
-    ex = manifests["executor"]
+    ex = manifests["loop"]
     outs = [gw.execute(ls, ex, ctx=ctx3) for _ in range(ex.limits.max_calls + 1)]
     _record("gateway", f"executor call #{ex.limits.max_calls + 1} (budget)",
             "PASS" if (outs[-1].status == "denied"
                        and all(o.status in ("ok", "nonzero_exit") for o in outs[:-1]))
             else "PERMISSIVE",
             f"{outs[-1].status}: {outs[-1].reason[:44]}")
+    # The manifest is named `loop`, so the budget key is `loop:run_command`.
+    # Hardcoding `executor:` here reported PERMISSIVE for correct behaviour -- a probe
+    # that fails on its own stale key is a probe you stop reading.
+    key = f"{ex.name}:run_command"
     _record("gateway", "budget is per task, not a module global",
-            "PASS" if ctx3.counters.gateway.get("executor:run_command")
-            and ctx.counters.gateway.get("executor:run_command", 0) == 0 else "PERMISSIVE",
-            "second task starts at zero")
+            "PASS" if (ctx3.counters.gateway.get(key)
+                       and ctx.counters.gateway.get(key, 0) == 0) else "PERMISSIVE",
+            f"key={key}: first task {ctx3.counters.gateway.get(key)}, "
+            f"second task {ctx.counters.gateway.get(key, 0)}")
 
     # Approval is per exact argv AND per task. Two independent things, and both are
     # checked here: an approval in one task must not authorise the same argv in
@@ -256,7 +265,7 @@ def section_gateway(ws: Path, settings, manifests, gw: Gateway) -> None:
     # approval is ever consulted, and the case would fail for the wrong reason. The
     # approval machinery only exists above tier 0, so testing it needs a manifest that
     # gets there. This is not a loosening of what ships: it is a test fixture.
-    approving = manifests["executor"].model_copy(update={"name": "executor_approving",
+    approving = manifests["loop"].model_copy(update={"name": "loop_approving",
                                                          "max_tier": 3})
     ctx4 = new_task("probe", settings=settings, root=ws)
     a = CommandSpec(argv=["/usr/bin/env", "/usr/bin/python3", "-c", "print(1)"],
@@ -343,7 +352,7 @@ def section_live(ws: Path, settings, manifests, gw: Gateway) -> None:
             ctx = new_task("probe", settings=settings, root=ws)
             spec = CommandSpec(argv=_absolutise(argv), why="probe",
                                **kw.pop("spec_kw", {}))
-            return gw.execute(spec, manifests["executor"], ctx=ctx,
+            return gw.execute(spec, manifests["loop"], ctx=ctx,
                               dry_run=False, **kw)
 
         r = _live(["cat", str(scratch / "notes.txt")])
@@ -384,7 +393,7 @@ def section_live(ws: Path, settings, manifests, gw: Gateway) -> None:
         t0 = time.time()
         ctx_y = new_task("probe", settings=settings, root=ws)
         r = gw.execute(CommandSpec(argv=["/usr/bin/yes"], why="probe"),
-                       manifests["executor"], ctx=ctx_y, approve=True,
+                       manifests["loop"], ctx=ctx_y, approve=True,
                        dry_run=False, timeout_s=6)
         dt = time.time() - t0
         _record("live", "unbounded output is capped, not buffered",
@@ -452,7 +461,7 @@ def main(argv: list[str] | None = None) -> int:
     settings = settings.replaced(read_roots=(ws,), write_root=ws,
                                  executor_enabled_tier=3, executor_dry_run=False)
     manifests = build_manifests((str(ws),), str(ws))
-    exec_m = manifests["executor"]
+    exec_m = manifests["loop"]
     policy = AccessPolicy.from_settings(settings, cwd=ws)
     gw = Gateway(settings=settings, enabled_tier=3)
     home = str(Path.home())

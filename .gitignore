@@ -1,5 +1,22 @@
-.venv
-.ipynb_checkpoints
-__pycache__/
-.git
+# Credentials. .env holds the live key; never tracked.
 .env
+.env.*
+!.env.example
+
+# The notebook moved to legacy/ with outputs stripped. Its checkpoints are noise.
+.ipynb_checkpoints/
+.ipynb_checkpoints
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+legacy/*.ipynb_checkpoints/

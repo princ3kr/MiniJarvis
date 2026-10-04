@@ -39,15 +39,16 @@ from .context import BudgetExhausted, TaskContext
 from .planner import (AgentResult, DSPY_OK, IMPLEMENTED_AGENTS, Plan, Step, StepStatus,
                       configure_dspy, make_plan, make_plan_fallback, replan)
 from .prompts import NOT_FOUND_REPLY, build_llm_messages, build_prompt_bundle
-from .strategy import route
 from .trace import FailureType, Verdict
 from .verifier import verify_step
 
-# KNOWN BUG (removal scheduled, Phase 1): the notebook's cap of 7 lives as a literal in
-# `planner.parse_plan_json` and never consults this constant, so this module advertises a
-# limit it does not enforce. Phase 1 makes one setting, read from both places.
 MAX_REPLANS = 2
-MAX_STEPS_PER_PLAN = 7
+
+# The plan-length cap lives in `planner.MAX_PLAN_STEPS` and is read there. It used to
+# be declared in BOTH modules: `planner` enforced a literal 7 and this module
+# advertised `MAX_STEPS_PER_PLAN = 7` that nothing read. Two constants for one
+# setting is one too many -- change this one and no behaviour changes, which is the
+# definition of dead. There is now exactly one.
 
 
 # --------------------------------------------------------------------------- scheduling
@@ -359,111 +360,38 @@ def ask(user_query: str, *, ctx: TaskContext, top_files: int = 3,
 # --------------------------------------------------------------------------- entry point
 def run_task(query: str, *, ctx: TaskContext, strategy: str = "auto",
              use_llm_verify: bool = True,
-             replans_left: int = MAX_REPLANS) -> str | None:
-    """Main entry. `strategy="auto"` walks the ladder and escalates on failure.
+             replans_left: int = MAX_REPLANS,
+             max_turns: int | None = None,
+             on_event=None) -> str | None:
+    """Main entry. Delegates to `pipeline.plan_path`.
 
-    strategy:
-      auto   -- route, then escalate direct -> plan -> react as stages fail to settle
-      direct -- one searchFiles call, no planner
-      plan   -- planner + orchestrator + verifier
-      react  -- the shell loop: think, act, verify, repeat
-
-    The ladder, not a classifier, is what makes `auto` trustworthy. A three-way
-    classifier has to be right about every query on the first try, and guessing low
-    (direct) costs one call, so `route()` only has to be roughly right -- the
-    escalation recovers the rest. Concretely: if `direct` returns nothing, try
-    `plan`; if the plan cannot settle it either, try `react`. This is what was
-    missing: the old gate could only ever choose direct-or-plan, so a diagnostic
-    question silently got a one-shot file search and a confident wrong answer.
+    Kept as a name here because `run_task` is the thing every caller already knows, and
+    a rename is not a refactor. The pipeline is:
+        LLM judge -> stage -> VERIFY (code first, rubric last) -> synthesise
+    with escalation direct -> loop -> plan when a stage returns not_found.
     """
-    if strategy == "auto":
-        r = route(query, ctx=ctx)
-        strategy = r.strategy
-        ctx.log("route", "strategy",
-                detail=f"{strategy} ({r.reason})", status="ok",
-                strategy=strategy, reason=r.reason, tool="router")
-        print(f"  strategy: {strategy}")
-        return _escalate(query, ctx=ctx, start=strategy,
-                         use_llm_verify=use_llm_verify,
-                         replans_left=replans_left)
+    from .pipeline import plan_path
 
-    if strategy == "direct":
-        answer = ask(query, ctx=ctx)
-        if answer is not None:
-            return answer
-        # Explicitly asked for direct and direct found nothing. Do NOT quietly
-        # escalate: the caller pinned the strategy, and silently spending more
-        # budget than asked for is its own bug. Say it and stop.
-        ctx.note("strategy='direct' found nothing; not escalating because the "
-                 "strategy was pinned. Use strategy='auto' to climb the ladder.")
-        return None
-
-    if strategy == "react":
-        return _react_answer(query, ctx=ctx, use_llm_verify=use_llm_verify)
-
-    if strategy != "plan":
-        raise ValueError(f"unknown strategy {strategy!r}")
-
-    return _plan_answer(query, ctx=ctx, use_llm_verify=use_llm_verify,
-                        replans_left=replans_left)
-
-
-def _escalate(query: str, *, ctx: TaskContext, start: str, use_llm_verify: bool,
-              replans_left: int) -> str | None:
-    """Walk the ladder from `start`, moving up when a stage cannot settle the query.
-
-    A stage "fails" by returning nothing, not by raising. The last rung returns its
-    own honest `None` -- `inconclusive` is a real outcome and pretending otherwise
-    would mean guessing.
-    """
-    order = ["direct", "plan", "react"]
-    try:
-        i = order.index(start)
-    except ValueError:
-        raise ValueError(f"unknown strategy {start!r}")
-
-    for stage in order[i:]:
-        ctx.log("route", "escalate", detail=f"trying {stage}", status="ok",
-                stage=stage, tool="router")
-        answer = _run_stage(stage, query, ctx=ctx, use_llm_verify=use_llm_verify,
-                            replans_left=replans_left)
-        if answer:
-            return answer
-        nxt = order[order.index(stage) + 1] if order.index(stage) + 1 < len(order) else None
-        if nxt is None:
-            ctx.note("react exhausted its turns without settling the question; "
-                     "reporting inconclusive rather than guessing.")
-            return None
-        ctx.note(f"{stage} could not settle the question; escalating to {nxt}.")
-        print(f"  {stage} found nothing -> escalating to {nxt}")
-
+    r = plan_path(query, ctx=ctx, strategy=strategy, use_llm_verify=use_llm_verify,
+                  replans_left=replans_left, max_turns=max_turns, on_event=on_event)
+    if r.ok and r.text:
+        return r.text
     return None
 
 
-def _run_stage(stage: str, query: str, *, ctx: TaskContext, use_llm_verify: bool,
-               replans_left: int) -> str | None:
-    if stage == "direct":
-        return ask(query, ctx=ctx)
-    if stage == "plan":
-        return _plan_answer(query, ctx=ctx, use_llm_verify=use_llm_verify,
-                            replans_left=replans_left)
-    if stage == "react":
-        return _react_answer(query, ctx=ctx, use_llm_verify=use_llm_verify)
-    raise ValueError(f"unknown stage {stage!r}")
+def stage_result(query: str, *, ctx: TaskContext, strategy: str = "auto",
+                 use_llm_verify: bool = True, replans_left: int = MAX_REPLANS,
+                 max_turns: int | None = None, on_event=None):
+    """The pipeline's full `StageResult` -- outcome, evidence, and what was tried.
 
-
-def _react_answer(query: str, *, ctx: TaskContext, use_llm_verify: bool) -> str | None:
-    from .react import run_react
-
-    print("  react: think -> act -> verify")
-    r = run_react(query, ctx=ctx, use_llm_verify=use_llm_verify)
-    if r.steps:
-        print(r.render()[-4000:])
-    if r.answer:
-        return r.answer
-    if r.status != "answered":
-        ctx.note(f"react ended {r.status} after {r.turns} turn(s)")
-    return None
+    What the interactive CLI and the eval harness use. `run_task` returns only the
+    verified text because that is all a caller should ever show; the tried-list and the
+    outcome are needed to explain a `not_found`, so they are a separate accessor
+    rather than a longer return value nobody reads.
+    """
+    from .pipeline import plan_path
+    return plan_path(query, ctx=ctx, strategy=strategy, use_llm_verify=use_llm_verify,
+                     replans_left=replans_left, max_turns=max_turns, on_event=on_event)
 
 
 def _plan_answer(query: str, *, ctx: TaskContext, use_llm_verify: bool,
@@ -569,6 +497,5 @@ def _plan_answer(query: str, *, ctx: TaskContext, use_llm_verify: bool,
         return None
 
 
-__all__ = ["MAX_REPLANS", "MAX_STEPS_PER_PLAN", "ready_steps", "blocked_steps",
-           "execute_plan", "run_task", "ask", "synthesize",
-           "_escalate", "_react_answer", "_plan_answer"]
+__all__ = ["MAX_REPLANS", "ready_steps", "blocked_steps",
+           "execute_plan", "run_task", "stage_result", "ask", "synthesize"]

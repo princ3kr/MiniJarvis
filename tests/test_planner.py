@@ -142,20 +142,17 @@ def test_parse_caps_plan_length_at_seven():
     assert len(p.steps) == 7, len(p.steps)
 
 
-def test_plan_cap_is_seven_and_the_constant_is_decorative():
-    """KNOWN BUG (removal scheduled, Phase 1): the cap is a literal in
-    `parse_plan_json`; `engine.MAX_STEPS_PER_PLAN` is never read by anything. Change the
-    constant and no behaviour changes."""
+def test_plan_cap_has_exactly_one_owner():
+    """The cap used to be declared twice: `planner.MAX_PLAN_STEPS` (enforced) and
+    `engine.MAX_STEPS_PER_PLAN` (read by nothing, so changing it changed no behaviour).
+    Two constants for one setting is one too many. Asserted by absence, because a
+    re-declaration is exactly what this guards."""
     assert planner.MAX_PLAN_STEPS == 7
-    assert engine.MAX_STEPS_PER_PLAN == 7
+    assert not hasattr(engine, "MAX_STEPS_PER_PLAN"), \
+        "the decorative duplicate is back"
     src = planner.parse_plan_json.__doc__ or ""
     import inspect
     assert "cleaned[:MAX_PLAN_STEPS]" in inspect.getsource(planner.parse_plan_json)
-    # and nothing in the package reads MAX_STEPS_PER_PLAN
-    engine_src = inspect.getsource(engine)
-    assert "MAX_STEPS_PER_PLAN" not in engine_src.replace(
-        "MAX_STEPS_PER_PLAN = 7", "").replace(
-        '"MAX_STEPS_PER_PLAN", ', "")
 
 
 def test_parse_drops_steps_with_no_instruction():
@@ -226,9 +223,36 @@ def test_alias_table_keys_are_the_stripped_form():
         assert canon in AGENT_REGISTRY, (key, canon)
 
 
-def test_only_searchfiles_is_implemented():
-    assert IMPLEMENTED_AGENTS == {"searchFiles"}
-    assert AGENT_REGISTRY - IMPLEMENTED_AGENTS, "the registry should name unimplemented roles"
+def test_the_registry_holds_only_agents_that_exist():
+    """`webSearch` and `assistant` were declared for the notebook's whole life with
+    nothing behind them, so a plan step naming one failed at RUN time instead of at
+    PLANNING time. Worse, the registry is what a model copies from when it writes a
+    plan, so naming an agent with no runner teaches it to emit steps that cannot run.
+
+    Now the registry IS the implemented set: adding a name means writing the runner
+    first, deliberately.
+    """
+    # `planner` is allowed to differ: it is a role the orchestrator plays, not an
+    # agent a step dispatches to. Everything else must have a runner.
+    assert AGENT_REGISTRY - IMPLEMENTED_AGENTS == {"planner"}
+    assert "webSearch" not in AGENT_REGISTRY
+    assert "assistant" not in AGENT_REGISTRY
+
+    # And every implemented agent must have a manifest, so the two cannot drift.
+    from jarvis.manifests import build_manifests
+    m = build_manifests(("/tmp",), "/tmp")
+    assert IMPLEMENTED_AGENTS <= set(m), \
+        f"no manifest for {sorted(IMPLEMENTED_AGENTS - set(m))}"
+
+
+def test_aliases_cannot_reach_a_removed_agent():
+    """The alias table is a second door into the vocabulary. Removing a name from the
+    registry while leaving "websearch" in the aliases would keep it reachable."""
+    # Values, not the source text: a comment may legitimately name what was removed.
+    for gone in ("webSearch", "assistant"):
+        assert gone not in planner.AGENT_ALIASES.values(), \
+            f"an alias still reaches {gone}"
+        assert gone not in planner.AGENT_ALIASES
 
 
 # ---------------------------------------------------------------- scheduling
@@ -570,9 +594,10 @@ def test_dead_branch_use_planner_is_gone(ctx, monkeypatch):
     import inspect
     src = inspect.getsource(engine.run_task)
     assert "use_planner" not in src, "the dead branch is back"
-    # and the plan stage is a real function that the ladder can call
-    assert callable(engine._plan_answer)
-    assert callable(engine._react_answer)
+    # and the pipeline that replaced it is real, and the stages are reachable
+    from jarvis import pipeline
+    assert callable(pipeline.plan_path)
+    assert set(pipeline.STAGES) == {"direct", "loop", "plan"}
 
 
 def test_dead_ends_helper_is_not_a_module_global():

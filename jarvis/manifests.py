@@ -55,36 +55,35 @@ def build_manifests(read_roots: tuple[str, ...],
     roots = tuple(str(r) for r in read_roots)
     write = str(write_root)
     return {
-        "discovery": AgentManifest(
-            name="discovery", tools=("find", "grep", "read", "survey", "index_query"),
-            read_roots=roots, write_roots=(), network=False,
-            max_tier=0, limits=Limits(max_calls=8, timeout_s=15),
+        # One key per agent in `planner.AGENT_REGISTRY`, spelled the same way. They
+        # used to disagree -- manifests said `discovery`/`executor`/`answerer`, the
+        # planner vocabulary said `searchFiles`/`loop`/`planner` -- which meant a test
+        # asserting "every implemented agent has a manifest" passed for the wrong
+        # reason and nobody noticed. Two vocabularies is one too many; the manifest
+        # names are canonical and `normalise_agent` maps model spellings onto them.
+        "searchFiles": AgentManifest(
+            name="searchFiles", tools=("find", "grep", "read", "survey", "index_query"),
+            read_roots=roots, write_roots=(), network=False, max_tier=0,
+            limits=Limits(max_calls=8, timeout_s=15),
             description="read-only filesystem discovery"),
-        # KNOWN BUG (removal scheduled, Phase 5): webSearch is declared so plans can
-        # target it, but nothing implements it. A plan step naming it fails at run
-        # time instead of at planning time. Phase 5 restricts the planner vocabulary
-        # to implemented agents, or implements webSearch behind an importlib check.
-        "webSearch": AgentManifest(
-            name="webSearch", tools=("search", "fetch"), read_roots=(),
-            network=True, max_tier=0),
-        "planner": AgentManifest(
-            name="planner", tools=(), read_roots=(), max_tier=0,
-            description="no tools, structurally"),
-        "answerer": AgentManifest(
-            name="answerer", tools=(), read_roots=(), max_tier=0),
-        # Frozen. Present so the machinery is exercised, but max_tier=0 for the
-        # discovery agent means it cannot be reached from a normal task.
-        # The shell executor. `max_tier=0` and `network=False` are the two numbers
-        # that matter: the agent can run shell commands against the machine and
-        # still cannot write, execute code, or reach the network, because every
-        # command is classified before it runs. `isolation="none"` is honest --
-        # there is no sandbox, and the rlimits plus the jail are the containment.
-        "executor": AgentManifest(
-            name="executor", tools=("run_command",),
+
+        # The shell loop. `max_tier=0` and `network=False` are the two numbers that
+        # matter: the agent can run shell commands against this machine and still
+        # cannot write, execute code, or reach the network, because every command is
+        # classified before it runs. `isolation="none"` is honest -- there is no
+        # sandbox, and the jail plus the rlimits are the containment.
+        "loop": AgentManifest(
+            name="loop", tools=("run_command",),
             read_roots=roots, write_roots=(),
             network=False, max_tier=0, isolation="none",
             limits=Limits(max_calls=12, timeout_s=30, max_output_bytes=20_000),
             description="shell tool, read-only commands only; NO SANDBOX"),
+
+        # A role, not a dispatch target: the orchestrator makes the plan, no step is
+        # dispatched to it.
+        "planner": AgentManifest(
+            name="planner", tools=(), read_roots=(), max_tier=0,
+            description="no tools, structurally"),
     }
 
 
@@ -104,5 +103,9 @@ class Registry:
         return self.manifests.get(name)
 
     def implemented(self) -> set[str]:
-        """Agents with a runner. The planner's vocabulary is this set in Phase 5."""
-        return {"discovery", "planner", "answerer", "executor"}
+        """Agents a plan step can actually be dispatched to.
+
+        Read from the manifests rather than restated, so the answer cannot drift from
+        the thing it describes.
+        """
+        return {n for n, m in self.manifests.items() if m.tools}

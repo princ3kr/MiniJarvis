@@ -154,9 +154,23 @@ class HTTPProvider:
             raise LLMConfigError(f"HTTP {code}: key rejected by {base_url}.")
         if code == 404:
             self._log(trace, "llm", tag, f"HTTP 404 {model}", t0, status="config_error")
+            # Ask the endpoint what it DOES serve. "model not found" on its own sends
+            # the user looking at their key, which is fine, or at their URL, which is
+            # usually fine -- and never at the actual mismatch, which is that the
+            # configured model belongs to a different provider. This happened here:
+            # a Groq endpoint configured with `gpt-4o-mini`, an OpenAI model Groq does
+            # not serve, reported identically to a bad key.
+            available = self.discover(base_url, key)
+            hint = ""
+            if available:
+                shown = ", ".join(available[:8])
+                hint = (f" This endpoint serves: {shown}"
+                        + (f" (+{len(available) - 8} more)" if len(available) > 8 else "")
+                        + ". Set LLM_MODEL in .env to one of these.")
             raise LLMConfigError(
                 f"HTTP 404: model {model!r} not found or not accessible at {base_url}. "
-                f"Candidates: {', '.join(self.candidates()) or '(none configured)'}")
+                f"Configured fallbacks: {', '.join(self.candidates()[1:]) or '(none)'}"
+                f".{hint}")
         if code == 429:
             self._log(trace, "llm", tag, "HTTP 429", t0, status="error")
             raise LLMUnavailable(f"rate limited (HTTP 429) on {model}")
@@ -187,6 +201,10 @@ class HTTPProvider:
         self._log(trace, "llm", tag, f"{data.get('model', model)} -> {len(text)} chars",
                   t0, tokens=usage.get("total_tokens"))
         return {"text": text, "usage": usage, "model": data.get("model", model)}
+
+    def discover(self, base_url: str, key: str | None) -> list[str]:
+        """Instance form, so `self` is available. See the module-level function."""
+        return discover(base_url, key)
 
     def candidates(self) -> list[str]:
         models = [self.config.model]
@@ -240,6 +258,36 @@ def max_tokens_for(payload: dict) -> int:
 
 
 # --------------------------------------------------------------------------- facade
+def discover(base_url: str, key: str | None) -> list[str]:
+    """Model ids this endpoint actually serves, or [] if it will not say.
+
+    Providers disagree about where the listing lives. OpenAI and Groq's OpenAI
+    compatibility layer both expose `/models`, but Groq serves it at
+    `/openai/v1/models` rather than `/v1/models`, so both are tried. Failure is
+    always [] -- this runs on an error path, and a discovery call that raises would
+    replace a useful message with a useless one.
+    """
+    import requests
+
+    root = base_url.rstrip("/")
+    urls = [f"{root}/models"]
+    if root.endswith("/v1") and "/openai/v1" not in root:
+        urls.insert(0, root.replace("/v1", "/openai/v1") + "/models")
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code != 200:
+                continue
+            data = r.json().get("data") or []
+            ids = [str(m.get("id")) for m in data if isinstance(m, dict) and m.get("id")]
+            if ids:
+                return sorted(ids)
+        except Exception:
+            continue
+    return []
+
+
 def call(ctx: TaskContext, messages: list[dict], *, provider: LLMProvider | None = None,
          temperature: float | None = None, max_tokens: int | None = None,
          purpose: str = "answer") -> dict:

@@ -91,23 +91,40 @@ class AgentResult:
 
 
 # --------------------------------------------------------------------------- registry
-AGENT_REGISTRY = {"searchFiles", "webSearch", "planner", "assistant"}
-IMPLEMENTED_AGENTS = {"searchFiles"}
+# ONLY what exists. `webSearch` and `assistant` were here for the whole of the
+# notebook's life with nothing behind them: a plan step naming one failed at RUN time
+# instead of at PLANNING time, so the failure surfaced as "agent not implemented"
+# halfway through a task rather than as a rejected plan.
+#
+# That is worse than useless, because the vocabulary is what a model copies when it
+# writes a plan. Naming an agent it can see in the registry teaches it to emit steps
+# that cannot run. The vocabulary is now exactly the set with a runner, and adding
+# one is a deliberate act: write the runner, then add the name.
+# `planner` is a ROLE the orchestrator plays (it makes the plan), not an agent a step
+# can be dispatched to -- a step naming it has no runner and would fail at run time.
+# It stays in the registry so the vocabulary is complete and honest about the
+# distinction, and out of IMPLEMENTED_AGENTS because that set is exactly "has a
+# runner".
+AGENT_REGISTRY = {"searchFiles", "planner", "loop"}
+IMPLEMENTED_AGENTS = {"searchFiles", "loop"}
 
 # model-invented aliases -> canonical name
 # Keys are the agent name with every non-letter stripped, because normalise_agent()
 # does exactly that before lookup. So "file_search_agent" -> "filesearchagent".
+#
+# Aliases for REMOVED agents are gone too. Keeping "websearch" -> something would mean
+# the model could still reach a name that has no runner, which is the exact failure
+# this registry was changed to remove.
 AGENT_ALIASES = {
     # searchFiles
     "filesearchagent": "searchFiles", "filesearch": "searchFiles",
     "search": "searchFiles", "searchfiles": "searchFiles",
     "searchfile": "searchFiles", "explore": "searchFiles", "finder": "searchFiles",
     "filesystem": "searchFiles", "locate": "searchFiles", "grep": "searchFiles",
-    # webSearch
-    "websearch": "webSearch", "web": "webSearch", "scout": "webSearch",
-    "browse": "webSearch", "internet": "webSearch", "docs": "webSearch",
-    # other roles
-    "plan": "planner", "reason": "assistant", "assistant": "assistant",
+    # planner / loop
+    "plan": "planner", "planning": "planner",
+    "loop": "loop", "react": "loop", "reactloop": "loop", "shell": "loop",
+    "command": "loop", "runcommand": "loop", "exec": "loop",
 }
 
 

@@ -143,7 +143,7 @@ def authorize(spec: CommandSpec, manifest, *, ctx: TaskContext,
 
     policy = AccessPolicy.from_settings(s, cwd=ctx.root)
     try:
-        verdict = classify(spec, manifest, access=policy)
+        verdict = classify(spec, manifest, access=policy, settings=s)
     except Exception as e:
         # Fail closed. A classifier fault is not evidence of safety.
         reason = f"classifier error: {type(e).__name__}: {str(e)[:80]}"
@@ -202,7 +202,7 @@ def execute(spec: CommandSpec, manifest, *, ctx: TaskContext, approve: bool = Fa
     # Dry-run applies to anything that is not provably read-only. Tier 0 commands
     # still run, because a system that cannot grep its own workspace is not useful.
     policy = AccessPolicy.from_settings(s, cwd=ctx.root)
-    verdict = classify(spec, manifest, access=policy)
+    verdict = classify(spec, manifest, access=policy, settings=s)
     if dry and verdict.tier is not Tier.READ_ONLY:
         reason = "dry-run: nothing that writes or executes was run"
         ctx.log("gateway", "execute", detail=reason, status="dry_run", t0=t0)
@@ -402,7 +402,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.tier:
         policy = AccessPolicy.from_settings(settings, cwd=ctx.root)
         try:
-            v = classify(spec, manifest, access=policy)
+            v = classify(spec, manifest, access=policy, settings=s)
         except Exception as e:
             print(f"classifier error: {type(e).__name__}")
             return 3

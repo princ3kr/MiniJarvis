@@ -165,7 +165,7 @@ def test_dangerous_flags_are_still_denied():
     tmp = Path(tempfile.mkdtemp())
     (tmp / "f").write_text("x")
     s = load_settings().replaced(read_roots=(tmp,), write_root=tmp)
-    ex = build_manifests((tmp,), str(tmp))["executor"]
+    ex = build_manifests((str(tmp),), str(tmp))["loop"]
     access = AccessPolicy.from_settings(s, cwd=tmp)
 
     v = classify(CommandSpec(argv=["/usr/bin/sed", "-i", "s/a/b/", str(tmp / "f")],

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, replace
+from typing import Any
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -56,6 +57,23 @@ def env_flag(name: str, default: bool) -> bool:
 # The read scope. A single list, used by every tool, every command operand, and the
 # metadata index. The notebook had two independent jails (`safe_resolve` and
 # `_resolve_in`), which disagreed about relative paths.
+def _read_roots_from_env() -> tuple[Path, ...]:
+    """The read scope, from `JARVIS_READ_ROOTS` (comma-separated) or `JARVIS_READ_ROOT`.
+
+    Two names because a single root is the common case and `READ_ROOT` reads better
+    for it, while a scope is naturally a list. Both expand, both resolve, and an
+    empty value falls back to the home directory rather than to an empty scope --
+    an empty read scope is a safe failure, and silently making one would look like
+    "the agent is broken" rather than "you configured it wrong".
+    """
+    multi = _env("JARVIS_READ_ROOTS")
+    if multi:
+        parts = [p.strip() for p in multi.split(",") if p.strip()]
+    else:
+        parts = [_env("JARVIS_READ_ROOT", str(Path.home()))]
+    return tuple(Path(p).expanduser().resolve() for p in parts)
+
+
 READ_ROOTS: tuple[Path, ...] = (
     Path(_env("JARVIS_READ_ROOT", str(Path.home()))).expanduser().resolve(),
 )
@@ -83,11 +101,36 @@ SKIP_DIRS: frozenset[str] = frozenset({
 #     `*` crosses directory separators -- so `*/.env` blocks it at ANY depth
 #   * a pattern without "/" is matched against the basename
 #   * a leading "~" is expanded
+# Read NEVER needs these. Each entry is either a credential, a kernel-internal
+# pseudo-filesystem, or another agent's private store -- and the kernel ones matter
+# because "search the whole system" naturally reaches /proc, where every process's
+# environment and open file descriptors are readable. `/proc/self/environ` is the
+# API key.
+#
+# Widened deliberately BEFORE the scope was widened, per the plan. Adding paths to
+# the read scope while these are missing is how an agent ends up reporting the
+# contents of someone's browser profile.
 DENY_GLOBS: tuple[str, ...] = (
-    "~/.ssh/*", "~/.aws/*", "~/.gnupg/*", "~/.config/gcloud/*", "~/.kube/*",
+    # --- credentials and keys
+    "~/.ssh/*", "~/.aws/*", "~/.gnupg/*", "~/.kube/*", "~/.config/gcloud/*",
+    "~/.docker/config.json", "~/.npmrc", "~/.pypirc", "~/.netrc",
+    "~/.config/gh/*", "~/.config/hub", "~/.local/share/keyrings/*",
+    "~/.local/share/kwallet*", "~/.password-store/*",
     "*/id_rsa*", "*/id_ed25519*", "*/id_ecdsa*", "*.pem", "*.key", "*_rsa",
     "*/.env", "*/.env.*", "*/.netrc", "*/credentials*", "*api_key*", "*apikey*",
     "*.p12", "*.keystore", "*/.git-credentials", "*/.bash_history", "*/.zsh_history",
+    "*/.pgpass", "*/.my.cnf", "*/.gem/credentials",
+    # --- kernel and device pseudo-filesystems. Reading these is not a privacy
+    # question so much as a correctness one: /proc reports live state that changes
+    # between two reads of the same path, so any "file" found there is a fiction.
+    "/proc/*", "/sys/*", "/dev/*", "/run/secrets/*",
+    # --- browser profiles. Cookies and session storage are a live account takeover.
+    "*/.mozilla/firefox/*", "*/.config/google-chrome/*", "*/.config/chromium/*",
+    "*/.config/BraveSoftware/*", "*/Library/Application Support/Google/Chrome/*",
+    "*/.config/opera/*", "*/.config/microsoft-edge/*",
+    # --- other agents' and tools' private state
+    "~/.opencode/*", "~/.claude/*", "~/.config/opencode/*", "~/.ollama/*",
+    "~/.local/share/Trash/*", "~/.local/share/recently-used.xbel",
 )
 
 # --------------------------------------------------------------------------- files
@@ -195,8 +238,12 @@ class LLMConfig:
     timeout_s: int = 60
     temperature: float = 0.0
     max_tokens: int = 900
-    # Groq's daily token limit is per-model, so a fallback must stay on the SAME
-    # model or the retry hits a different bucket that may also be exhausted.
+    # Fallbacks are tried in order when a call fails transiently. The comment that
+    # used to sit here -- that Groq's daily limit is per-model, so a fallback must
+    # stay on the same model -- was about one provider and no longer described what
+    # the code does: this is a generic list and a caller may legitimately span
+    # providers. What still holds is that a fallback is only useful if the endpoint
+    # can serve it, which `preflight` checks before any task runs.
     fallback_models: tuple[str, ...] = ()
 
     def with_fallbacks(self) -> "LLMConfig":
@@ -216,14 +263,53 @@ class Settings:
     # nothing below tier 0 is reachable by an agent even if a flag is flipped.
     executor_enabled_tier: int = 0
     executor_dry_run: bool = True
+    executor_max_calls: int = 12
+    executor_timeout_s: int = 30
     planner_cot: bool = True
     verifier_cot: bool = False
     verifier_rubric: bool = True
     use_rg: bool | None = None
+    # None -> the react loop derives its turn cap from budget.max_iterations, which
+    # is the real authority. Set this only to make it smaller.
+    react_max_turns: int | None = None
 
     def replaced(self, **kw) -> "Settings":
         """Copy with overrides. Tests use this instead of mutating globals."""
         return replace(self, **kw)
+
+
+def _limits_from_env() -> Limits:
+    """Every `Limits` field from `LIMIT_<FIELD>`, so no limit is hardcoded.
+
+    Driven off the dataclass rather than written out, because a hand-written list
+    drifts: adding a field to `Limits` and forgetting this function is how you get a
+    limit that exists in the source and cannot be configured. Fields whose declared
+    type is not a number (or bool) are skipped rather than mis-parsed.
+
+    Reads `LIMIT_FOO` and, as a convenience, the unprefixed `FOO`, because the
+    unprefixed name is what someone types and the prefixed one is what the docs say.
+    """
+    import dataclasses
+
+    kw: dict[str, Any] = {}
+    for f in dataclasses.fields(Limits):
+        want_bool = f.type in ("bool", bool)
+        raw = _env(f"LIMIT_{f.name.upper()}") or _env(f.name.upper())
+        if raw is None:
+            continue
+        try:
+            if want_bool:
+                kw[f.name] = raw.strip().lower() not in ("0", "false", "no", "off")
+            elif f.type in ("float", float):
+                kw[f.name] = float(raw)
+            else:
+                kw[f.name] = int(raw)
+        except ValueError:
+            # A malformed value must not crash startup -- it must be visible. The
+            # default stands and the caller finds out from behaviour, which is worse
+            # than a message, so note it rather than swallowing it.
+            print(f"[config] ignoring malformed LIMIT_{f.name.upper()}={raw!r}")
+    return Limits(**kw)
 
 
 def load_settings(**overrides) -> Settings:
@@ -239,24 +325,39 @@ def load_settings(**overrides) -> Settings:
         max_tokens=int(_env("JARVIS_MAX_TOKENS", "200000")),
         wall_clock_s=float(_env("JARVIS_WALL_CLOCK_S", "300")),
         max_replans=int(_env("JARVIS_MAX_REPLANS", "2")),
+        max_parallel_plans=int(_env("JARVIS_MAX_PARALLEL_PLANS", "4")),
     )
+    # The key name is a compatibility question, not a preference: both were in use
+    # at different points, and silently preferring the wrong one gives "no API key"
+    # on a machine that has one.
+    api_key = (_env("LLM_API_KEY") or _env("GROQ_API_KEY")
+               or _env("OPENAI_API_KEY") or _env("OPENROUTER_API_KEY"))
     env_llm = LLMConfig(
-        base_url=_env("LLM_BASE_URL"),
+        base_url=_env("LLM_BASE_URL") or _env("OPENAI_BASE_URL"),
         model=_env("LLM_MODEL"),
         dspy_model=_env("DSPY_MODEL"),
-        api_key=_env("GROQ_API_KEY") or _env("LLM_API_KEY"),
+        api_key=api_key,
         timeout_s=int(_env("LLM_TIMEOUT_S", "60")),
+        temperature=float(_env("LLM_TEMPERATURE", "0.0")),
+        max_tokens=int(_env("LLM_MAX_TOKENS", "1500")),
+        fallback_models=tuple(
+            m.strip() for m in (_env("LLM_FALLBACK_MODELS") or "").split(",") if m.strip()),
     )
     settings = Settings(
+        limits=_limits_from_env(),
         budget=env_budget,
         llm=env_llm,
+        read_roots=_read_roots_from_env(),
+        write_root=Path(_env("WRITE_WORKSPACE", "~/jarvis_workspace")).expanduser().resolve(),
         executor_enabled_tier=int(_env("EXECUTOR_ENABLED_TIER", "0")),
         executor_dry_run=env_flag("EXECUTOR_DRY_RUN", True),
+        executor_max_calls=int(_env("EXECUTOR_MAX_CALLS", "12")),
+        executor_timeout_s=int(_env("EXECUTOR_TIMEOUT_S", "30")),
         planner_cot=env_flag("PLANNER_COT", True),
         verifier_cot=env_flag("VERIFY_COT", False),
         verifier_rubric=env_flag("VERIFIER_RUBRIC", True),
-        use_rg=None if _env("JARVIS_USE_RG") is None
-        else env_flag("JARVIS_USE_RG", True),
+        use_rg=None if _env("USE_RG") is None else env_flag("USE_RG", True),
+        react_max_turns=int(_env("REACT_MAX_TURNS", "0")) or None,
     )
     return settings.replaced(**overrides) if overrides else settings
 
