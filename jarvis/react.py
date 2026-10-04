@@ -701,6 +701,11 @@ class ReactLoop:
                 # `ls` output is evidence, not a sentence.
                 return self._synthesise(goal, steps)
 
+        if self.stuck._verdicts and len(self.stuck._verdicts) >= self.stuck.threshold:
+            why = self.stuck.explain()
+            if why:
+                self.ctx.note(why)
+                return ReactResult(None, "stuck", steps)
         return ReactResult(None, "inconclusive", steps)
 
     def _synthesise(self, goal: str, steps: list[Step]) -> ReactResult:

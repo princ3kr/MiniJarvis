@@ -283,7 +283,18 @@ def _plan_stage(query: str, *, ctx: TaskContext, use_llm_verify: bool,
         # The cap is this stage's share divided among its steps, so a 3-step plan does
         # not have its whole budget consumed by step 1 -- which is what happened: step
         # 2 and 3 were refused at turn 1 with the task budget already spent.
-        per_step = max(2, (turn_cap or ctx.budget.max_iterations) // max(1, len(plan.steps)))
+        # Each sub-goal gets the stage's share divided by the number of steps.
+        #
+        # `turn_cap` is what is LEFT of the task budget, not what the stage was
+        # allocated. Using the allocation and dividing again was a double division: a
+        # 3-step plan with a 5-turn allocation gave each step `max(2, 5//3)` = 2
+        # turns, which is not enough to run a command, read the output, and finish.
+        # Observed on the eval: every plan-routed case ended
+        # "no sub-goal produced a verified result" with the sub-loops reporting 0
+        # turns of real work.
+        remaining = max(1, ctx.budget.max_iterations - ctx.counters.iterations)
+        per_step = max(3, min(turn_cap or remaining,
+                              remaining // max(1, len(plan.steps))) or remaining)
         sub = run_react(step.instruction, ctx=ctx, max_turns=per_step,
                         use_llm_verify=use_llm_verify)
         tried.append(f"step {step.id} -> {sub.status} ({sub.turns} turns)")
@@ -354,6 +365,7 @@ def plan_path(query: str, *, ctx: TaskContext, strategy: str = "auto",
 
     current = strategy
     last: StageResult | None = None
+    stage_results: list[StageResult] = []
 
     while True:
         if visits.get(current, 0) >= MAX_RUNG_VISITS:
@@ -394,6 +406,7 @@ def plan_path(query: str, *, ctx: TaskContext, strategy: str = "auto",
         res.tried = tried_all + res.tried
         tried_all = res.tried
         last = res
+        stage_results.append(res)
         emit("stage", f"{current} -> {res.outcome}"
                       + (f" ({res.reason})" if res.reason else ""))
 
@@ -429,13 +442,37 @@ def plan_path(query: str, *, ctx: TaskContext, strategy: str = "auto",
         emit("route", f"{current} did not settle it — escalating to {nxt}")
         current = nxt
 
-    # Nothing verified. The plan wants an honest "not found" plus what was tried --
-    # not an apology, and never a guess.
-    if last is not None and last.text:
-        last.outcome = "near_miss"
-    return last or StageResult(outcome="not_found", strategy=strategy,
-                               reason="no strategy produced a verified answer",
-                               tried=tried_all)
+    # Nothing verified. Report the most INFORMATIVE failure, not merely the last one.
+    #
+    # The ladder ends wherever escalation stopped, which is usually `plan` -- and
+    # `plan`'s reason is "no sub-goal produced a verified result", which says nothing
+    # about the `loop` that actually got closest. Reporting that as the failure is
+    # true and useless: every eval case ended with the same sentence regardless of
+    # what had actually been tried.
+    best = last
+    for cand in stage_results:
+        if _progress(cand) > _progress(best):
+            best = cand
+    if best is None:
+        return StageResult(outcome="not_found", strategy=strategy,
+                           reason="no strategy produced a verified answer",
+                           tried=tried_all)
+    best.tried = tried_all
+    if best.text:
+        best.outcome = "near_miss"
+    return best
+
+
+def _progress(r: "StageResult | None") -> int:
+    """How much work a stage did, as a comparable number.
+
+    Evidence blocks only. `tried` is deliberately NOT counted: it accumulates across
+    stages by design, so a later rung always has a longer list and would always win --
+    which is the same bug as reporting the last stage, just with extra steps.
+    """
+    if r is None:
+        return -1
+    return len(r.evidence)
 
 
 # --------------------------------------------------------------------------- verify
