@@ -11,8 +11,19 @@ from .observation import Observation
 
 
 def _build_grep_cmd(query: str, base: Path, policy: AccessPolicy, settings: Settings,
-                    regex: bool = False, max_per_file: int = 3, case_sensitive: bool = False) -> list[str]:
-    cmd = ["grep", "-rI", "-n", "-m", str(max_per_file)]
+                    regex: bool = False, max_per_file: int = 3,
+                    case_sensitive: bool = False, recursive: bool = True) -> list[str]:
+    # `-H` is not optional. grep omits the filename prefix when given a single file
+    # and prints `LINE:TEXT`; with `-r DIR` it prints `PATH:LINE:TEXT`. The parser
+    # below splits on path/line/body, so the single-file form silently produced zero
+    # hits and the tool reported `not_found` for a file that plainly matched.
+    # Forcing the prefix makes the output format identical in both cases.
+    #
+    # `-r` and `-I` are bundled as `-rI` in one token, which means a caller cannot
+    # strip recursion by filtering argv -- the first attempt at single-file support
+    # did exactly that and silently kept recursing. The flag is a parameter here
+    # instead.
+    cmd = ["grep", "-rI" if recursive else "-I", "-H", "-n", "-m", str(max_per_file)]
     if not regex:
         cmd.append("-F")
     else:
@@ -53,6 +64,23 @@ def search_content(query: str, *, ctx: TaskContext, root: Path | str | None = No
     max_res = max_results if max_results is not None else limits.grep_max_results
     max_pf = max_per_file if max_per_file is not None else limits.grep_max_per_file
 
+    # A root that does not exist is a caller error, and reporting it as such beats
+    # letting Popen fail: a missing cwd surfaces as FileNotFoundError from the
+    # spawn, which the runner words as "no such executable" and names the BINARY --
+    # which exists. The message would be actively misleading about what went wrong.
+    if not base.exists():
+        dur = (time.perf_counter() - t0) * 1000
+        return Observation(tool="grep", status="not_found",
+                           reason=f"no such path: {base}", duration_ms=dur)
+
+    # A root that is a FILE is a legitimate request ("search this one file"), but
+    # `grep -r` needs a directory as its cwd. Without this check the runner raises
+    # NotADirectoryError and -- because the tool layer is contractually forbidden from
+    # raising across an agent boundary -- that used to become `not_found`: a
+    # confident "nothing matches" for a file that does match. So: run non-recursively
+    # against the file, which is both correct and faster.
+    single_file = base.is_file()
+
     use_rg = ctx.settings.use_rg
     cmd = None
     # Try ripgrep if requested and available
@@ -75,12 +103,26 @@ def search_content(query: str, *, ctx: TaskContext, root: Path | str | None = No
             cmd.append(str(base))
     if cmd is None:
         cmd = _build_grep_cmd(query, base, policy, ctx.settings, regex=regex,
-                              max_per_file=max_pf, case_sensitive=case_sensitive)
+                              max_per_file=max_pf, case_sensitive=case_sensitive,
+                              recursive=not single_file)
 
-    out = run_tool(cmd, cwd=base, timeout_s=limits.timeout_s)
+    # The child's cwd must be a DIRECTORY. When the target is a single file, the
+    # file's own parent is used and the recursion flag is dropped -- `grep -r` with a
+    # file as cwd raises NotADirectoryError, and a tool that cannot raise across the
+    # agent boundary would turn that into a false `not_found`.
+    workdir = base.parent if single_file else base
+
+    out = run_tool(cmd, cwd=workdir, timeout_s=limits.timeout_s)
     if out.status == "timeout":
         dur = (time.perf_counter() - t0) * 1000
         return Observation(tool="grep", status="error", reason="timeout", duration_ms=dur)
+    if out.status == "error":
+        # Report the failure. Falling through to `not_found` here would assert
+        # "nothing matched" when in fact nothing ran, which is the one thing a
+        # search tool must never do.
+        dur = (time.perf_counter() - t0) * 1000
+        return Observation(tool="grep", status="error", reason=out.reason or "could not run",
+                           duration_ms=dur)
 
     hits: list[dict] = []
     seen: dict[str, int] = {}
@@ -98,7 +140,7 @@ def search_content(query: str, *, ctx: TaskContext, root: Path | str | None = No
                 continue
             line_no = int(line_str)
             try:
-                p = policy.resolve(raw_path)
+                p = policy.resolve(raw_path, base=workdir)
             except AccessDenied:
                 continue
             if not policy.in_scope(p):
@@ -120,7 +162,7 @@ def search_content(query: str, *, ctx: TaskContext, root: Path | str | None = No
                 continue
             line_no, body = int(parts[0]), parts[1]
             try:
-                p = policy.resolve(raw_path)
+                p = policy.resolve(raw_path, base=workdir)
             except AccessDenied:
                 continue
             if not policy.in_scope(p):

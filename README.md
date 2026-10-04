@@ -10,11 +10,40 @@ notebook is one nobody runs.
 
 ## Run it
 
+Use `./run.sh`, which finds the venv for you:
+
 ```bash
-.venv/bin/python -m jarvis "where is safe_resolve defined?"
+./run.sh                                  # needs a query, prints usage
+./run.sh "where is run_process defined?"
+./run.sh --check                          # is the config sane?
+./run.sh probe                            # the policy self-test
+./run.sh test                             # the test suite
+./run.sh -- ls -la                        # ask the policy about one command
+./run.sh --tier -- cat /etc/passwd        # classify without running
 ```
 
-The venv matters: `dspy` and `pydantic` are not in system python.
+Or call the module directly. The venv matters: `dspy` and `pydantic` are not in
+system python.
+
+```bash
+.venv/bin/python -m jarvis "where is run_process defined?"
+.venv/bin/python -m jarvis --check
+.venv/bin/python -m jarvis.probe --quiet
+```
+
+Useful flags on a query:
+
+| flag | effect |
+|---|---|
+| `--root DIR` | search somewhere specific (must be inside the read scope) |
+| `--strategy direct` | skip the plan/replan machinery; one agent, one pass |
+| `--no-verify` | structural checks only, no rubric, no LLM judge |
+| `--last 20` | only the tail of the trace and attempts |
+
+`--no-verify` is the one to reach for when you are iterating. It drops the per-step
+LLM judge, so a query costs one call instead of several.
+
+As a library:
 
 ```python
 from jarvis.context import new_task

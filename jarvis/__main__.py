@@ -54,7 +54,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.query:
         ap.print_usage()
-        print("\nnothing to do. try: python -m jarvis \"where is safe_resolve defined?\"")
+        # Not "safe_resolve": that function was the notebook's tool-side jail and
+        # became `access.resolve` during extraction, so the old name appears
+        # nowhere in the package. A hint that points at a function you cannot grep
+        # for is worse than no hint.
+        print("\nnothing to do. try: python -m jarvis \"where is run_process defined?\"")
         return 2
 
     settings = load_settings()

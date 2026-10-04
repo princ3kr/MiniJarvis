@@ -106,3 +106,71 @@ def test_read_observation_valid(ctx, tmp_workspace):
     assert isinstance(obs, Observation)
     assert obs.status == "ok"
     assert obs.tool == "read"
+
+
+# ------------------------------------------------------------------ root handling
+def test_relative_root_is_resolved_to_an_absolute_path(tmp_workspace, monkeypatch):
+    """REGRESSION: `TaskContext.root` is annotated Path but nothing enforced it, so
+    `--root jarvis` left it as the string 'jarvis'. `policy.resolve` then resolved
+    that against itself, producing `/proj/jarvis/jarvis` -- a nonexistent path that
+    is still inside the read scope, so nothing raised. The agent searched a directory
+    that was never there and answered `not_found` with full confidence."""
+    monkeypatch.chdir(tmp_workspace)
+    from jarvis.context import new_task
+    ctx = new_task("t", root="project")
+    assert isinstance(ctx.root, Path), type(ctx.root)
+    assert ctx.root.is_absolute()
+    assert ctx.root == (tmp_workspace / "project").resolve()
+
+
+def test_a_relative_root_finds_what_it_should(settings, tmp_workspace, monkeypatch):
+    """The user-visible consequence of the above. A confident `not_found` from a
+    search tool is the worst failure mode it has, so this asserts the positive."""
+    monkeypatch.chdir(tmp_workspace)
+    (tmp_workspace / "project" / "src" / "target_symbol.txt").write_text("needle_here\n")
+    from jarvis.context import new_task
+    ctx = new_task("t", settings=settings, root="project")
+    obs = grep.search_content("needle_here", ctx=ctx, root=ctx.root)
+    assert obs.status == "ok", obs.reason
+    assert any("target_symbol.txt" in h["path"] for h in obs.items)
+
+
+def test_grep_works_on_a_single_file(ctx, tmp_workspace):
+    """A file as root is a legitimate request.
+
+    Two bugs met here and both produced `not_found` for a file that matches:
+      * `grep -r` with a file as cwd raises NotADirectoryError, and a tool that
+        cannot raise across the agent boundary turned that into "nothing matched"
+      * `grep PATTERN FILE` omits the filename prefix (it prints `LINE:TEXT`, not
+        `PATH:LINE:TEXT`), so the parser's path split found nothing
+    `-H` forces the prefix; recursion is dropped for a single file.
+    """
+    f = tmp_workspace / "single.py"
+    f.write_text("alpha\nMATCHME\nomega\n")
+    obs = grep.search_content("MATCHME", ctx=ctx, root=f)
+    assert obs.status == "ok", obs.reason
+    assert len(obs.items) == 1
+    assert obs.items[0]["line_no"] == 2
+    assert obs.items[0]["path"].endswith("single.py")
+
+
+def test_grep_single_file_output_format_matches_recursive(ctx, tmp_workspace):
+    """One parser, two shapes of grep output. If the prefix can vanish, the parser
+    needs a branch -- so it does not."""
+    (tmp_workspace / "sub").mkdir()
+    (tmp_workspace / "sub" / "a.py").write_text("SYMBOL_X\n")
+    (tmp_workspace / "b.py").write_text("SYMBOL_X\n")
+    single = grep.search_content("SYMBOL_X", ctx=ctx, root=tmp_workspace / "b.py")
+    multi = grep.search_content("SYMBOL_X", ctx=ctx, root=tmp_workspace)
+    assert single.status == "ok" and multi.status == "ok"
+    assert all("path" in h and "line_no" in h for h in single.items)
+    assert all("path" in h and "line_no" in h for h in multi.items)
+
+
+def test_grep_on_a_missing_path_says_so(ctx, tmp_workspace):
+    """It must not surface as `no such executable`, which names the BINARY -- and the
+    binary exists. A misleading message about what failed sends the caller looking
+    in the wrong place."""
+    obs = grep.search_content("x", ctx=ctx, root=tmp_workspace / "nope.py")
+    assert "no such path" in obs.reason
+    assert "executable" not in obs.reason

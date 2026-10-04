@@ -82,6 +82,25 @@ class TaskContext:
             self.budget = self.settings.budget
         if self.root is None:
             self.root = self.settings.read_roots[0]
+        elif not isinstance(self.root, Path):
+            # A string root must be made absolute HERE, at the boundary.
+            #
+            # `TaskContext.root` is annotated `Path`, and every consumer treats it as
+            # one -- but nothing enforced that. `--root jarvis` left it as the string
+            # `'jarvis'`, and `policy.resolve(root)` then resolved that string
+            # against itself, producing `/home/u/proj/jarvis/jarvis`: a path that
+            # does not exist, inside the scope, so nothing raised. The agent searched
+            # a directory that was never there and reported `not_found` with full
+            # confidence. A confident wrong answer from a search tool is the worst
+            # failure mode there is, and it hid behind an unnormalised input.
+            #
+            # Normalising at construction means no downstream caller has to wonder
+            # whether `ctx.root` is a Path or a str.
+            self.root = Path(self.root).expanduser()
+            if not self.root.is_absolute():
+                self.root = (Path.cwd() / self.root).resolve()
+        elif not self.root.is_absolute():
+            self.root = self.root.expanduser().resolve()
 
     # ------------------------------------------------------------- lifecycle
     def elapsed_s(self) -> float:

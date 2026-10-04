@@ -24,7 +24,23 @@ fi
 cmd="${1:-}"
 shift || true
 
+usage() {
+  cat <<'USAGE'
+usage: ./run.sh [command] [args...]
+
+  ./run.sh "query"                 ask a question (flags: --root --strategy --no-verify --last)
+  ./run.sh --check                 verify the LLM config and the jail
+  ./run.sh probe                   policy self-test; exits non-zero on any finding
+  ./run.sh test                    the test suite
+  ./run.sh exec -- ls -la          run one command through the gateway
+  ./run.sh exec --tier -- cat f    classify without running
+
+no command given, so nothing ran. The agent is read-only, but it is not free.
+USAGE
+}
+
 case "$cmd" in
+  --check) exec "$PY" -m jarvis --check ;;
   probe)  exec "$PY" -m jarvis.probe "$@" ;;
   test)   exec "$PY" -m pytest tests/ -q "$@" ;;
   check)  exec "$PY" - <<'PYEOF'
@@ -52,7 +68,12 @@ PYEOF
     exec "$PY" -m jarvis.gateway "$@"
     ;;
   "")
-    exec "$PY" -m jarvis
+    usage
+    exit 2
+    ;;
+  -h|--help|help)
+    usage
+    exit 0
     ;;
   *)
     exec "$PY" -m jarvis "$cmd" "$@"
