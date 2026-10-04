@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "Read-only file agent with a router, a discovery loop, and a verifier"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2",
+    "requests>=2",
+]
+
+[project.optional-dependencies]
+# dspy is OPTIONAL on purpose. Under system python the planner and ReAct silently
+# fall back to deterministic behaviour -- nothing crashes, you just get a different
+# (worse) agent. Making it optional documents that, instead of hiding it.
+dspy = ["dspy>=3"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+jarvis = "jarvis.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["jarvis*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+# Fail loudly if a test leaves the network reachable or a walk unbounded.
+addopts = "-q --strict-markers"
+markers = [
+    "slow: walks a real tree; excluded from the default run",
+    "network: requires a live LLM endpoint",
+    "live: executes a real command against a scratch tree",
+]
