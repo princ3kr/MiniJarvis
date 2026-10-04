@@ -289,9 +289,55 @@ class ReactLoop:
         if action == "survey":
             return survey_tool.survey_files(ctx=self.ctx,
                                             root=args.get("root") or self.ctx.root)
+        if action in ("index_query", "index"):
+            return self._index_query(args)
         return Observation(tool=action, status="error", items=[],
                            text=f"unknown action {action!r}; use run_command or finish",
                            reason=f"unknown action {action!r}")
+
+    def _index_query(self, args: dict[str, Any]) -> Observation:
+        """Query the metadata index. Read-only SELECT, enforced LIMIT, age shown.
+
+        For attribute questions -- "how many .py files over 1MB", "what changed
+        today" -- this is a SQL query against the index instead of a `find` walk. It
+        is the cheapest way to answer, and the index stores size and mtime, so those
+        questions do not need the filesystem touched at all.
+
+        The age is included in the observation on purpose. A stale index produces
+        confident answers about files that have moved, which is worse than no index,
+        and the model cannot reason about staleness it is not told about.
+        """
+        from .index import FileIndex
+
+        idx = FileIndex(settings=self.ctx.settings)
+        if not idx.exists():
+            return Observation(tool="index_query", status="not_found", items=[],
+                               text="no index has been built. Run `jarvis --index` first.",
+                               reason="no index")
+        sql = str(args.get("sql") or "").strip()
+        if not sql:
+            return Observation(tool="index_query", status="error", items=[],
+                               text="no sql given", reason="no sql given")
+        limit = int(args.get("limit") or 20)
+        try:
+            rows = idx.query(sql, limit=limit)
+        except ValueError as e:
+            # The SQL guard refused. Say so -- this is information, and a refusal
+            # the model cannot read is a refusal it retries.
+            return Observation(tool="index_query", status="blocked", items=[],
+                               text=str(e), reason=str(e)[:200])
+        st = idx.stats()
+        body = "\n".join(
+            "  " + "  ".join(f"{k}={v}" for k, v in r.items()) for r in rows)
+        head = (f"index: {st.entries} entries, built "
+                + ("never" if st.age_s() == float("inf")
+                   else f"{st.age_s():.0f}s ago"
+                   + (" (STALE)" if st.is_stale() else "")))
+        return Observation(tool="index_query",
+                           status="ok" if rows else "not_found",
+                           items=rows, text=f"{head}\n{body}" if body else head,
+                           total_lines=len(rows), n_lines=len(rows), start_line=1,
+                           reason=head)
 
     # ------------------------------------------------------------------ one turn
     def _decide(self, goal: str, trajectory: str, n: int):

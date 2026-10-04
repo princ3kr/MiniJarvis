@@ -170,6 +170,12 @@ verifies its own work. A config error is reported AS a config error. A strategy 
 model invents is not coerced.
 
 ## react.py  -- the loop
+Actions the loop can dispatch to:
+    run_command, find, grep, read, survey, index_query
+`index_query` is a read-only SELECT against the metadata index, with an enforced
+LIMIT and the index AGE in the observation -- a stale index produces confident
+answers about files that moved, and the model cannot reason about staleness it is
+not told about.
 ```python
 run_react(goal, *, ctx, max_turns=None, use_llm_verify=True) -> ReactResult
 ReactResult: answer, status, steps, answer_source, verified
