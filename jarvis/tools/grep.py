@@ -29,8 +29,12 @@ def _build_grep_cmd(query: str, base: Path, policy: AccessPolicy, settings: Sett
             cmd.append(f"--exclude-dir={deny}")
     for e in sorted(NO_TEXT_EXT):
         cmd.append(f"--exclude=*{e}")
-    cmd.append(str(base))
+    # ORDER MATTERS: the PATTERN must precede the PATH. `grep ... PATH PATTERN`
+    # makes grep treat the pattern as a second filename, exit 2 with
+    # "No such file or directory", and return zero hits -- a confident false
+    # "nothing matched". The notebook had this right; the extraction lost it.
     cmd.append(query)
+    cmd.append(str(base))
     return cmd
 
 

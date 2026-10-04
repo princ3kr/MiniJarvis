@@ -10,6 +10,31 @@ from jarvis.tools import find, grep, read, survey
 from jarvis.tools.observation import Observation
 
 
+def test_grep_pattern_precedes_path(ctx, tmp_workspace):
+    """REGRESSION: `grep ... PATH PATTERN` makes grep treat the pattern as a
+    second filename, exit 2 with "No such file or directory", and return zero
+    hits. That is a confident false "nothing matched" -- the worst kind of bug
+    in a search agent, because it looks like a correct negative answer.
+
+    The notebook had the order right; the Phase 0 extraction lost it.
+    """
+    (tmp_workspace / "target.txt").write_text("NEEDLE_HERE\nother line\n")
+    obs = grep.search_content("NEEDLE_HERE", ctx=ctx, root=tmp_workspace)
+    assert obs.status == "ok", f"grep found nothing for a string that exists: {obs.reason}"
+    assert any("target.txt" in h["path"] for h in obs.items)
+    assert any(h["line_no"] == 1 for h in obs.items)
+
+
+def test_grep_reports_honest_negative_for_absent_string(ctx, tmp_workspace):
+    """The converse: a string that genuinely is not there must still be not_found.
+
+    Guards against "fixing" the above by making grep always return something.
+    """
+    obs = grep.search_content("definitely_not_present_9f3a", ctx=ctx, root=tmp_workspace)
+    assert obs.status == "not_found"
+    assert obs.items == []
+
+
 def test_find_returns_observation_and_ranking(ctx, tmp_workspace):
     obs = find.find_files("main", ctx=ctx, root=tmp_workspace)
     assert isinstance(obs, Observation)
