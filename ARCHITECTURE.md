@@ -1,198 +1,231 @@
-# Architecture: what runs, in what order
+# Architecture
 
-Phase 0 status. Read this to understand the flow; the code is the authority when the
-two disagree.
+Read this after the code, not before. It records why the layering is the way it is,
+what was measured, and what is deliberately still wrong.
 
-## The shape of a task
+## The pipeline
 
 ```
 query
-  │
-  ├─ ROUTER (needs_plan) ──→ direct ──→ searchFiles agent ──→ answer
-  │        [regex gate]      │
-  │                         └─ plan ──→ Plan ──→ orchestrator ──┐
-  │                                    (DAG, ready queue)        │
-  │                                                              ▼
-  └────────────────────────────────────────────────────► VERIFIER
-                                                            │
-                                       ┌────────────────────┴─────────────┐
-                                       │ pass/unsure                       │ fail
-                                       ▼                                   ▼
-                                    answer                        dead_ends() ──→ replan
-                                                                          (≤2)
+  -> router.route            ONE model call: direct | loop | plan + a reason
+  -> pipeline.plan_path      the stage runs
+       direct   one tool call, downgraded to near_miss if only fuzzy hits
+       loop     react.ReactLoop, bounded by a share of the iteration budget
+       plan     planner v2: sub-goals, each run by a bounded loop
+  -> pipeline.synthesize_verified
+       code first   verify_paths, _unsupported_numbers, verify_disk.recheck_disk_claims
+       rubric last  the LLM, because it is the only part that understands prose
+  -> StageResult(found | near_miss | not_found | error)
+  -> escalate direct -> loop -> plan on near_miss / not_found
+  -> text, or NOT FOUND plus what was tried
 ```
 
-Inner loop (`run_agent` → tools): for a locate query it recalls by name, then by
-folder hint, then by content, then reads the top N. For an aggregate query it
-surveys once. There is **no model-driven iteration** yet — that is Phase 3.
+### Why a ladder and not a classifier
 
-## Layers, and who may depend on whom
+A three-way classifier has to be right about every query on the first try. A ladder
+only has to be roughly right, because a stage that cannot settle the question is
+itself the signal to try the next one. Guessing low costs one tool call; guessing
+wrong costs one turn.
+
+`error` deliberately does NOT escalate. If the endpoint is down, the next rung fails
+identically, and three strategies' worth of budget to reach the same 401 is worse
+than reporting the error.
+
+### Why the router is a model
+
+The decision is not lexical:
+
+    "which file is >= 100MB"        needs `find -size`, i.e. a command
+    "how many images are there"     one tool call
+    "compare a.py and b.py"         two searches and a join
+
+The first and second differ by one word. A cue list that separated them would be a
+coincidence, and the previous one (`PLAN_NEEDED_CUES`) had no cue that could ever
+select the loop, so `strategy="auto"` had two reachable rungs out of three.
+
+The fast path — `detect_query_type`, `extract_intent` — stays, as an exact-lookup
+helper. It is structurally barred from `route()`; `test_no_regex_decides_the_strategy`
+reads `route()`'s source and fails if it consults any fast-path name.
+
+## Layering
 
 ```
-                    ┌──────────────────────────┐
-                    │  engine   router         │  workflow (may change per phase)
-                    │  planner  verifier       │
-                    │  agents   prompts        │
-                    └────────────┬─────────────┘
-                                 │
-                    ┌────────────▼─────────────┐
-                    │  gateway  policy  tools  │  the safety core
-                    │  runner                  │
-                    └────────────┬─────────────┘
-                                 │
-                    ┌────────────▼─────────────┐
-                    │  llm                     │  the seam
-                    └────────────┬─────────────┘
-                                 │
-                    ┌────────────▼─────────────┐
-                    │  context  trace          │  per-task state
-                    └────────────┬─────────────┘
-                                 │
-                    ┌────────────▼─────────────┐
-                    │  access  redaction       │  the jail
-                    │  config                  │
-                    └──────────────────────────┘
+cli -> pipeline -> router / react / plan_stage
+                      |
+                   engine (scheduler, planner orchestration)
+                      |
+              gateway -> policy -> runner
+                      |
+                  access  (the jail)
 ```
 
-Dependencies point **downward only**. Nothing in the lower four layers imports the
-upper four, which is what makes the safety core testable in isolation.
-
-## The per-task contract
-
-Every entry point takes a `TaskContext` and nothing else. There is no global state
-to reset between tasks — that was the notebook's central defect.
-
-```python
-from jarvis.context import new_task
-from jarvis.engine import run_task
-
-ctx = new_task("files over 100MB in ~/Downloads")
-answer = run_task(ctx, strategy="auto")
-print(ctx.trace.render_attempts())
-print(ctx.summary())          # llm_calls, tool_calls, tokens, budget_stop
-```
-
-`TaskContext` owns:
-
-| | replaces |
-|---|---|
-| `budget`, `check()`, `charge_*()` | the absence of any limit |
-| `counters` (incl. `gateway` per tool) | `_GATEWAY_CALLS` + `gateway_reset()` |
-| `trace` (`Event` + `Attempt`) | `LOGS` + `PATH_LOG` |
-| `approvals`, `fingerprint()` | `APPROVAL_GRANTED` |
-| `last_exit/stdout/stderr` | `_LAST_EXIT/_LAST_OUT/_LAST_ERR` |
-
-Two tasks in one process are independent. That is the property that makes the
-notebook's `gateway_reset()` hack unnecessary.
+Dependencies point downward only. `access.py` depends on nothing in the package.
+`runner.py` depends on `redaction` and `config` and not on `access`, `policy` or
+`gateway` — it is told where to run, not whether it may.
 
 ## The jail
 
-`access.AccessPolicy` is the **only** thing permitted to decide whether a path is
-readable. Tools, command operands, and the index all call `policy.resolve(...)`.
+`access.AccessPolicy` is the only thing permitted to decide whether a path is
+readable. Tools, command operands, postconditions, the index and the verification
+disk-recheck all call `policy.resolve(...)`.
 
-Order of checks, and why:
+Three predicates, not one, because they answer different questions:
 
-1. expand `~`
-2. resolve relative against the task's real cwd (not the process cwd, and never
-   "try each root until one works" — that fan-out is why the notebook's tool jail
-   and command jail disagreed about where `notes.txt` was)
-3. containment by `Path.parents`, not string prefix, so `/home/u-evil` is not
-   inside `/home/u`
-4. **deny-list last, and it always wins** — a tier-0 read cannot reach a secret
-   even though the secret is inside the read scope
-
-`policy.walkable(dir)` is separate from `resolve`, because a recursive walk must
-stop the **descent**, not just filter the output. Filtering output is not enough:
-`grep -r` still reads the bytes on the way past, which is a probe finding.
-
-## Budgets
-
-A model-driven loop is unbounded by construction, so limits are not optional:
-
-```
-max_llm_calls 12 · max_tool_calls 40 · max_iterations 8
-max_tokens 200_000 · wall_clock_s 300 · max_replans 2
-```
-
-`ctx.check()` raises `BudgetExhausted` **before** spending anything. That is an
-outcome, not a crash: `TaskContext.__exit__` catches it, records a note, and the
-engine reports what was found and what was not. `ctx.summary()["budget_stop"]`
-names the ceiling that stopped it.
-
-## Verifier semantics
-
-Three verdicts, and the middle one is the one that gets confused:
-
-| verdict | means | effect |
+| | question | scope |
 |---|---|---|
-| `pass` | checked, satisfied | step `done` |
-| `unsure` | **unproven, not wrong** | step `inconclusive`, reported separately |
-| `fail` | checked, wrong | step `failed`, added to `dead_ends()` |
+| `resolve(path, for_write=)` | may I read/write this exact path? | read roots / write roots + deny-list |
+| `walkable(dir)` | may a recursive walk DESCEND here? | deny-list + `SECRET_DIRS` + skip-dirs |
+| `nameable(dir)` | may this be NAMED in output? | deny-list + `SECRET_DIRS` |
 
-`unsure` becoming `fail` was a real bug: a rate-limited rubric made a working step
-look broken, and `inconclusive` results were fed to the planner as dead ends — which
-teaches a planner to avoid correct work.
+The split between `walkable` and `nameable` was a bug fix. The folder summary filtered
+its child listing by `skip_dirs` while its recursive histogram did not, so
+`__pycache__` was hidden from one half and counted in the other. Fixing it surfaced
+the sharper problem: the filter was a *name* check, not the jail, and `.ssh` is not
+in `skip_dirs`, so the listing announced `.ssh/` as a child. No contents leaked —
+`resolve` refused the key inside — but publishing the existence of a private-key
+directory to a remote model is a disclosure of its own, and preventing it is free.
 
-`dead_ends()` contains **failures only**, for that reason.
+So: `node_modules` is noise (nameable, not walkable) and `.ssh` is a secret (neither).
+Same call site, opposite answers, which is why they are separate methods.
 
-## Phase 0 known bugs (carried forward deliberately)
+## Policy
 
-These are preserved on purpose so later phases can remove them one at a time with a
-test proving each removal. Marked `# KNOWN BUG (removal scheduled)` in the source.
+`classify(spec, manifest, access, settings)` runs in a fixed order, and the order is
+load-bearing:
 
-| bug | where | removed in |
+1. resolve `argv[0]` — absolute, and in `TRUSTED_BIN_DIRS`. PATH is not trusted
+   because it contains `~/.local/bin`.
+2. always-denied and network-capable binaries
+3. unknown binary → APPROVAL. Never tier 0.
+4. `env` re-classifies whatever it wraps. It is a launcher, not a reader.
+5. dangerous flags (`find -exec`, `sed -i`, `grep --pre`, git retargeting)
+6. grammar: unknown flags escalate, never pass
+7. interpreters → APPROVAL when `isolation == "none"`
+8. git subcommand tier split
+9. every PATH operand through the jail
+10. cwd through the jail — READ scope, not write. A read-only agent must be able to
+    run `ls` in the tree it was asked to search.
+11. taint — but only for tier ≥ 1 (see below)
+12. tier floor
+13. the manifest caps everything
+
+### Short-flag handling
+
+Three things a hand-written flag table gets wrong, all found by feeding it real
+command lines:
+
+- **Bundling.** `wc -lw`, `tar -cf out.tar .`, `ls -lah`. `wc`'s `-l`/`-w` are
+  value-LESS selectors; typed as value-taking they made the commonest `wc` invocation
+  fail the bundle check.
+- **Attached values.** `cut -d:`, `-f1`, `-n5`. getopt accepts these; a parser that
+  only knew `--long=v` and `-s=v` reported "unknown flag".
+- **Illegal bundles.** `-fc` is genuinely ambiguous — POSIX reads `-fc` as `-f c`,
+  GNU tar reads it as `-f -c`. POSIX wins, and the consequence is safe either way
+  because the "value" becomes a path operand and goes through the jail.
+
+`tests/test_grammars.py` pins 40 ordinary invocations plus counter-tests that an
+unknown flag still escalates and `sed -i` still denies. A narrow grammar makes the
+agent look broken; a wide one is the failure that matters. Both directions are tested.
+
+### The policy injects prune arguments
+
+The loop does not write exclusions. `jarvis/prune.inject` appends them.
+
+This was measured: the prompt told the model to add `--exclude=.ssh` to every
+recursive command, and it produced `-not -path */.ssh/*` three turns running, which
+the grammar rejects. Every attempt was refused and the budget ran out.
+
+Three properties make it a control rather than a hole:
+
+- it only ever ADDS arguments, and runs AFTER authorization, so a command that was
+  going to be refused is still refused
+- `_unpruned()` re-derives the guarantee on the POST-injection argv — a guarantee
+  checked by the function that implements it is not a check
+- the post-rewrite argv is what runs AND what the trace shows
+
+## Verification
+
+The order is code first, rubric last, and each step earns its place by catching
+something the others cannot.
+
+| check | catches | why code |
 |---|---|---|
-| `needs_plan` substring cues misfire; never picks ReAct | `router` | Phase 4 (classifier + ladder) |
-| `MAX_STEPS_PER_PLAN` is decorative; the cap is a literal elsewhere | `engine` | Phase 1 (one setting) |
-| `use_planner` branch is unreachable | `engine` | Phase 4 |
-| regex intent detection + huge extension list | `agents` | Phase 3 (index + fast-path only) |
-| `webSearch` declared in the planner's vocabulary, unimplemented | `manifests` | Phase 5 |
-| snapshot/undo, tier 1/2, approvals, interpreters | frozen | Phase 6+ |
+| `verify_paths.unverified_paths` | a fabricated absolute path | a model asked "is this path in the evidence?" says yes often enough to be useless |
+| `react._unsupported_numbers` | `ls -l`'s `total 376` restated as "37K" | the number IS in the output, in the wrong column; a rubric says PASS |
+| `verify_disk.recheck_disk_claims` | evidence that is internally consistent and wrong | `stat` is cheaper than any model and cannot be talked into agreeing |
+| `pipeline.admits_failure` | "I don't have the information for any file" printed under a green ANSWER | it is a *truthful* sentence about the evidence, so every other check passes |
+| rubric | prose claims | the only part that understands prose |
 
-### Removed, and proved removed
+Two of these exist because the failure they catch passed everything else.
 
-Each of these was a probe finding against the notebook's executor. They are fixed, and
-`python -m jarvis.probe` is the regression net — **zero PERMISSIVE is the bar**.
+`_unsupported_numbers` matches on TOKEN boundaries. Substring matching passed on
+exactly the bug it was written for, because `total 376` contains "37" — the same
+failure as the approval fingerprint that joined argv with spaces.
+
+The checks run again on the SYNTHESIS, not just the evidence. Verifying the evidence
+and then letting the model write freely from it leaves the gap this closes.
+
+## Frozen
+
+`jarvis/frozen/` holds tiers 1 and 2, taint escalation, and the interpreter rule. It
+is gated on `Settings.executor_enabled_tier`, which ships at 0.
+
+One subtlety worth recording: `frozen.enabled(None)` returns **True**. Unknown
+settings must fail safe. The first version defaulted to 0, concluded the frozen tiers
+were unreachable, and classified `touch` as tier 0 — the probe reported PERMISSIVE for
+correct behaviour. Applying a floor can only ever make a command *more* restricted, so
+assuming the worst is free.
+
+## Runner
+
+One place a child process starts. Six guarantees:
+
+- no shell, argv only
+- scrubbed env, so a subprocess printing its own environment cannot return a key
+- `start_new_session` + `killpg`. `proc.kill()` kills only the direct child, so
+  `sh -c 'sleep 999'` leaves a grandchild holding the pipes and the timeout *hangs*
+  instead of firing.
+- rlimits read from `Limits`. The notebook hard-coded 1 GiB in a closure, which made
+  `Limits` decorative. `RLIMIT_NPROC` still unset — per-UID, not per-process.
+- bounded ring buffer keeping the TAIL. `communicate()` buffered without limit, and
+  the first capped version let `yes` run the full timeout anyway.
+- redaction on the way out
+
+## Removed, and proved removed
+
+`python -m jarvis.probe` is the regression net. **Zero PERMISSIVE is the bar.**
 
 | finding | fix |
 |---|---|
-| `find -fprint0` wrote a file at tier 0 | dangerous-flag set in `policy` |
-| `cat`/`ls`/`diff`/`grep` read outside the read roots | every PATH operand resolves through the jail |
-| policy keyed on `basename(argv[0])`, so `./cat` and `/tmp/git` classified as the real tools | `argv[0]` must be absolute **and** in `TRUSTED_BIN_DIRS`; `PATH` is not trusted because it contains `~/.local/bin` |
-| `git commit`/`add`/`branch -D` were all tier 0 | git subcommand tier split; `config alias.*` denied |
-| `git diff --output=`, `--git-dir=`, `-C` retargeted or wrote | each denied explicitly |
-| approval key was `" ".join(argv)`, so `["a b"]` matched `["a","b"]` | `ctx.fingerprint` is `\x00`-joined |
-| approvals lived in a module set, shared across tasks | per-task `ctx.approvals` |
-| `exit_code` postcondition did `str(v) in _LAST_EXIT`, so "1" matched "10" | exact comparison |
-| `file_exists` postcondition called `Path(p).exists()` unscoped, probing `/root/.ssh` through the exit status | postconditions resolve through the jail; unresolvable is a FAIL, not a pass |
-| `grep -r` walked into deny-listed dirs (`decoy-marker` leaked) | `_check_recursion` **requires** the exclusions to be present in argv |
-| `env python3 x.py` classified tier 0 | `env` is a launcher: the wrapped command is re-classified, `LD_PRELOAD`-class assignments denied |
-| `pip show` reached the network at tier 0 | network binaries denied without a sandbox |
-| unbounded output buffered without limit | bounded ring in `runner`; overflow kills the group |
-| `communicate()` on timeout left grandchildren holding the pipes | `killpg` on the child's own session |
+| `find -fprint0` wrote a file at tier 0 | dangerous-flag set |
+| reads outside the read roots | every PATH operand through the jail |
+| `basename(argv[0])` let `./cat` and `/tmp/git` pass as the real tools | absolute + trusted dir |
+| `git commit`/`add`/`branch -D` all tier 0 | subcommand tier split |
+| `git config alias.*` executed code | denied |
+| approval key was `" ".join(argv)` — `["a b"]` matched `["a","b"]` | `\x00`-joined |
+| approvals in a module set, shared across tasks | per-task `ctx.approvals` |
+| `exit_code` check did `str(v) in _LAST_EXIT` — "1" matched "10" | exact comparison |
+| `file_exists` postcondition called `Path(p).exists()` unscoped | jail-checked |
+| `grep -r` walked into deny-listed dirs | policy-injected exclusions |
+| `env python3 x.py` was tier 0 | `env` re-classifies what it wraps |
+| `pip show` reached the network at tier 0 | network binaries denied |
+| unbounded output buffered without limit | bounded ring |
+| `communicate()` left grandchildren on timeout | `killpg` |
 | executor never re-checked `max_calls` | charged and enforced per task |
 
-Two more things the probe found that were not findings but would have been. `sed` and
-`tar` had real grammars that were never wired into the registry, so every `sed -n` and
-`tar -cf` escalated to APPROVAL for no reason — a refusal caused by the policy's own
-wiring, which trains a model to stop asking. And POSIX short-flag bundling (`-cf`) was
-unknown, so ordinary `tar` syntax was treated as suspicious.
+Two more that were not findings but would have become them: `sed` and `tar` had real
+grammars that were never registered, so every `sed -n` and `tar -cf` escalated for no
+reason — a refusal caused by the policy's own wiring, which trains a model to stop
+asking.
 
-## Test layers
+## Known bugs, preserved
 
-```
-tests/test_access.py    the jail: escapes, symlinks, deny-list depth
-tests/test_index.py     deny-list at WRITE time; read-only SQL; staleness reported
-tests/test_tools.py     find/grep/read/survey against a tmp fixture tree
-tests/test_runner.py    env scrubbing, group kill, rlimits, the output cap
-tests/test_router.py    query shape + intent extraction
-tests/test_planner.py   DAG, JSON repair, replan id remap, dead ends
-```
+| bug | where | removed in |
+|---|---|---|
+| `MAX_PLAN_STEPS` is a literal not a setting | `planner` | when a setting is wanted |
+| `needs_plan` shim kept for API compatibility | `router` | with its last caller |
+| `run.sh` carries a fallback model default | `run.sh` | never; see README on `.env` |
 
-The probe is `python -m jarvis.probe`, a module rather than a notebook cell: a safety
-property that lives only inside a notebook is one nobody runs. It exits non-zero on any
-PERMISSIVE finding. Three cases are reported **INCONCLUSIVE** rather than PASS — `rg`
-is not installed on this machine, so the policy refuses it for being unknown, which
-proves nothing about `rg`.
+## Contract
 
-No test may touch the network or walk a real tree.
+`jarvis/CONTRACT.md` is the interface contract. Read it before changing a signature.
