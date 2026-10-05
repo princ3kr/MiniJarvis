@@ -522,7 +522,7 @@ def synthesize_verified(query: str, candidate: str, evidence: list[dict],
     letting the model write freely from it leaves the gap this is closing -- that is
     how "approximately 37K" got in, off evidence that did not contain it.
     """
-    from .react import _unsupported_numbers
+    from .react import _count_claim_mismatch, _unsupported_numbers
 
     corpus = "\n".join(str(e.get("output") or "") for e in evidence)
     if not corpus:
@@ -534,6 +534,10 @@ def synthesize_verified(query: str, candidate: str, evidence: list[dict],
     if admits_failure(candidate):
         return None, ("answer admits it could not find the information; that is a "
                       "not-found, not an answer")
+
+    bad = _count_claim_mismatch(candidate, corpus)
+    if bad:
+        return None, f"answer states {', '.join(bad)} files but the evidence lists a different number"
 
     # --- code first: numbers
     bad = _unsupported_numbers(candidate, corpus)

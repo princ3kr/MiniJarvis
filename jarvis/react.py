@@ -176,6 +176,50 @@ def _present_in(needle: str, haystack: str) -> bool:
     return False
 
 
+_COUNT_CLAIM = re.compile(
+    r"(?i)\b(?:there\s+(?:are|is)|the\s+count(?:\s+is)?|count(?:\s+is)?|"
+    r"(?:contains?|has|have|found|lists?)|total(?:\s+of)?)"
+    r"(?:\s+(?:about|approximately|roughly|around))?"
+    r"\s*(\d+)\s*(?:files?|items?|entries?)\b"
+)
+
+
+def _file_count_from_listing(text: str) -> int | None:
+    """Count file entries in a list-like command output, if it is clearly a listing.
+
+    This catches the common failure mode of `ls` output: a list of names is evidence,
+    but an answer that says "23 files" must match the count in that evidence exactly.
+    """
+    if not text:
+        return None
+    count = 0
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("total ") or s.startswith("ls:") or s.startswith("find:"):
+            continue
+        if s in (".", "..") or s.startswith("./"):
+            continue
+        if s.endswith("/"):
+            continue
+        if s.startswith("d") and len(s) > 1 and s[1] in "rwx":
+            continue
+        count += 1
+    return count or None
+
+
+def _count_claim_mismatch(answer: str, evidence: str) -> list[str]:
+    """Return numeric file-count claims in the answer that do not match the evidence."""
+    actual = _file_count_from_listing(evidence)
+    if actual is None:
+        return []
+    mismatches: list[str] = []
+    for m in _COUNT_CLAIM.finditer(answer):
+        claimed = int(m.group(1))
+        if claimed != actual:
+            mismatches.append(str(claimed))
+    return mismatches
+
+
 @dataclass
 class Step:
     """One turn. Kept whole so a failure can be explained after the fact."""
@@ -472,10 +516,19 @@ class ReactLoop:
             return Verdict.fail, ("no successful command output backs this answer; "
                                   "run something that works first")
 
+        evidence_text = "\n".join(good)
+        bad_counts = _count_claim_mismatch(answer, evidence_text)
+        if bad_counts:
+            actual = _file_count_from_listing(evidence_text)
+            return Verdict.fail, (
+                f"answer claims {', '.join(bad_counts)} files but evidence lists "
+                f"{actual} file entries"
+            )
+
         if not self.use_llm_verify:
             return Verdict.unsure, "verification skipped"
 
-        unsupported = _unsupported_numbers(answer, "\n".join(good))
+        unsupported = _unsupported_numbers(answer, evidence_text)
         try:
             out = self._call(self.ctx, [
                 {"role": "system", "content":

@@ -178,6 +178,14 @@ def test_a_confabulated_number_is_rejected():
     assert _unsupported_numbers("approximately 37K", "total 376\n") == ["37k"]
 
 
+def test_a_file_count_claim_is_checked_against_the_listing():
+    from jarvis.react import _count_claim_mismatch
+
+    evidence = "a.txt\nb.txt\nc.txt\n"
+    assert _count_claim_mismatch("There are 3 files in the folder.", evidence) == []
+    assert _count_claim_mismatch("The evidence lists 23 files, not 12.", evidence) == ["23"]
+
+
 def test_an_admission_is_not_an_answer():
     from jarvis.pipeline import admits_failure
 
