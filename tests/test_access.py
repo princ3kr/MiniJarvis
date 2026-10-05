@@ -47,6 +47,32 @@ def test_empty_path_is_refused(policy):
     assert e.value.reason == "empty"
 
 
+def test_settings_default_read_roots_follow_the_environment(monkeypatch, tmp_path):
+    from jarvis.config import Settings
+
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir(); second.mkdir()
+    monkeypatch.setenv("JARVIS_READ_ROOTS", f"{first},{second}")
+    monkeypatch.delenv("JARVIS_READ_ROOT", raising=False)
+
+    assert Settings().read_roots == (first.resolve(), second.resolve())
+
+
+def test_openrouter_env_aliases_are_supported(monkeypatch):
+    from jarvis.config import load_settings
+
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+
+    s = load_settings()
+    assert s.llm.base_url == "https://openrouter.ai/api/v1"
+    assert s.llm.api_key == "test-openrouter-key"
+
+
 # ------------------------------------------------------------------ containment
 def test_prefix_is_not_containment(tmp_workspace):
     """`/home/u-evil` starts with the string `/home/u` and is NOT inside it.

@@ -488,7 +488,8 @@ def preflight(settings=None, *, verbose: bool = True) -> dict:
     elif not cfg.model:
         out.update(kind="config", detail="LLM_MODEL is empty")
     elif not cfg.api_key:
-        out.update(kind="config", detail="no API key: set GROQ_API_KEY or LLM_API_KEY")
+        out.update(kind="config",
+                   detail="no API key: set LLM_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, or GROQ_API_KEY")
     else:
         prov = HTTPProvider(config=cfg, timeout_s=cfg.timeout_s)
         try:

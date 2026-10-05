@@ -46,6 +46,26 @@ def _env(name: str, default: str | None = None) -> str | None:
     return os.environ.get(name) or _parse_env_file(PROJECT_ROOT / ".env").get(name) or default
 
 
+def _env_any(*names: str, default: str | None = None) -> str | None:
+    """Prefer real env vars across equivalent aliases before falling back to .env.
+
+    This matters when a provider-specific value is exported in the shell but a stale
+    project `.env` still contains a different provider's default. The real shell
+    override must win, and the provider aliases should be treated as equivalent
+    names rather than as a single-name lookup.
+    """
+    for name in names:
+        value = os.environ.get(name)
+        if value not in (None, ""):
+            return value
+    env_file = _parse_env_file(PROJECT_ROOT / ".env")
+    for name in names:
+        value = env_file.get(name)
+        if value not in (None, ""):
+            return value
+    return default
+
+
 def env_flag(name: str, default: bool) -> bool:
     raw = _env(name)
     if raw is None:
@@ -74,9 +94,7 @@ def _read_roots_from_env() -> tuple[Path, ...]:
     return tuple(Path(p).expanduser().resolve() for p in parts)
 
 
-READ_ROOTS: tuple[Path, ...] = (
-    Path(_env("JARVIS_READ_ROOT", str(Path.home()))).expanduser().resolve(),
-)
+READ_ROOTS: tuple[Path, ...] = _read_roots_from_env()
 
 # Where write-tier commands may touch. Frozen tier 1/2 lives here.
 WRITE_ROOT: Path = Path(_env("WRITE_WORKSPACE", "~/jarvis_workspace")).expanduser().resolve()
@@ -270,8 +288,8 @@ class Settings:
     limits: Limits = field(default_factory=Limits)
     budget: Budget = field(default_factory=Budget)
     llm: LLMConfig = field(default_factory=LLMConfig)
-    read_roots: tuple[Path, ...] = READ_ROOTS
-    write_root: Path = WRITE_ROOT
+    read_roots: tuple[Path, ...] = field(default_factory=_read_roots_from_env)
+    write_root: Path = field(default_factory=lambda: Path(_env("WRITE_WORKSPACE", "~/jarvis_workspace")).expanduser().resolve())
     deny_globs: tuple[str, ...] = DENY_GLOBS
     skip_dirs: frozenset[str] = SKIP_DIRS
     # Frozen behind these flags. The discovery agent's manifest is max_tier=0, so
@@ -354,10 +372,9 @@ def load_settings(**overrides) -> Settings:
     # The key name is a compatibility question, not a preference: both were in use
     # at different points, and silently preferring the wrong one gives "no API key"
     # on a machine that has one.
-    api_key = (_env("LLM_API_KEY") or _env("GROQ_API_KEY")
-               or _env("OPENAI_API_KEY") or _env("OPENROUTER_API_KEY"))
+    api_key = _env_any("LLM_API_KEY", "GROQ_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY")
     env_llm = LLMConfig(
-        base_url=_env("LLM_BASE_URL") or _env("OPENAI_BASE_URL"),
+        base_url=_env_any("LLM_BASE_URL", "OPENAI_BASE_URL", "OPENROUTER_BASE_URL"),
         model=_env("LLM_MODEL"),
         dspy_model=_env("DSPY_MODEL"),
         api_key=api_key,
