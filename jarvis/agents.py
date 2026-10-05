@@ -40,7 +40,7 @@ from .access import AccessDenied, AccessPolicy
 from .context import TaskContext
 from .planner import AgentResult
 from .router import (AGENT_NAME_LITERAL, detect_query_type, extract_intent,
-                     is_simple_count_query)
+                     extract_extension_query, is_simple_count_query)
 from .tools import TOOL_MANIFEST
 from .tools import find as _find_tool
 from .tools.observation import Observation
@@ -244,6 +244,43 @@ def run_agent(user_query: str, *, ctx: TaskContext, top_files: int = 3,
     _rd = qtype["shape"] + (f" cats={qtype['categories']}" if qtype["categories"] else "")
     ctx.log("route", "route", detail=_rd, status="ok", shape=qtype["shape"],
             categories=qtype["categories"], cue=qtype["cue_hit"], tool="router")
+
+    extension = extract_extension_query(user_query)
+    if extension:
+        search_root = _aggregate_root(user_query, root, ctx=ctx)
+        simple_count = is_simple_count_query(user_query)
+        sv = call_tool("survey", ctx=ctx, root=search_root,
+                       extensions=[extension], include_skipped_dirs=True,
+                       count_only=simple_count)
+        ok = sv.status == "ok" and bool(sv.meta.get("complete", True))
+        count = sv.meta["matched_count"]
+        files = sv.meta["sample"]
+        if not ok:
+            summary = f"Extension search incomplete: {sv.reason or sv.status}."
+        elif simple_count:
+            label = "file" if count == 1 else "files"
+            summary = (f"Found {count} {extension} {label} under {search_root}. "
+                       "Denied private locations are excluded.")
+        elif count:
+            shown = "\n".join(files)
+            remainder = count - len(files)
+            label = "file" if count == 1 else "files"
+            summary = (f"Found {count} {extension} {label} under {search_root}:\n{shown}"
+                       + (f"\n... and {remainder} more." if remainder > 0 else "")
+                       + "\nDenied private locations are excluded.")
+        else:
+            summary = (f"No {extension} files found under {search_root}. "
+                       "Denied private locations are excluded.")
+        ctx.trace.event("agent", "run_agent", detail=user_query[:60],
+                        status="ok" if ok else "error", t0=t_start,
+                        shape="extension_search", extension=extension, tool="agent")
+        return {"status": "ok" if ok else "error", "query": user_query,
+                "intent": intent, "route": "extension_search", "extension": extension,
+                "searches": [{"by": "survey", "extension": extension,
+                              "root": str(search_root)}],
+                "survey": sv.meta, "evidence": [], "similar_files": [],
+                "summary": summary, "confidence": 1.0 if ok else 0.0,
+                "elapsed_ms": sv.duration_ms}
 
     # ---- aggregate: "how many images are there?"
     if qtype["aggregate"]:

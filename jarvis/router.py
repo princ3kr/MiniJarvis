@@ -285,6 +285,23 @@ FILENAME_RE = re.compile(
 BARE_FILENAME_RE = re.compile(
     r"\b(?:Dockerfile|Makefile|README|LICENSE|requirements|Procfile)\b", re.I)
 
+
+def extract_extension_query(query: str) -> str | None:
+    """Return a recognized extension explicitly requested as a file type."""
+    from .config import CATEGORIES
+
+    known = {extension.lstrip(".").lower()
+             for extensions in CATEGORIES.values() for extension in extensions}
+    matches = re.findall(
+        r"(?:\*\.|\.)([a-z0-9]{1,10})\b|\b([a-z0-9]{1,10})\s+"
+        r"(?:files?|videos?|images?|photos?|documents?)\b",
+        query, re.I)
+    for dotted, bare in matches:
+        extension = (dotted or bare).lower()
+        if extension in known:
+            return f".{extension}"
+    return None
+
 STOPWORDS = {
     "the", "a", "an", "is", "are", "was", "in", "on", "at", "to", "of", "and", "or",
     "for", "with", "why", "how", "what", "where", "which", "does", "do", "did", "can",
@@ -331,4 +348,5 @@ def extract_intent(query: str) -> dict[str, Any]:
 __all__ = ["route", "Route", "STRATEGIES", "ESCALATION", "JUDGE_PROMPT",
            "AGENT_NAME_LITERAL", "CATEGORY_WORDS", "AGGREGATE_CUES",
            "FILENAME_EXTS", "FILENAME_RE", "BARE_FILENAME_RE", "STOPWORDS",
-           "detect_query_type", "is_simple_count_query", "extract_intent"]
+           "detect_query_type", "is_simple_count_query", "extract_extension_query",
+           "extract_intent"]

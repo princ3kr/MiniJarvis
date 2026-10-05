@@ -226,6 +226,53 @@ def test_total_file_count_scopes_to_named_downloads(ctx, tmp_workspace, monkeypa
     assert str(downloads) in result.text
 
 
+def test_mp4_search_scopes_to_downloads_without_llm(ctx, tmp_workspace, monkeypatch):
+    from jarvis.pipeline import plan_path
+
+    downloads = tmp_workspace / "Downloads"
+    downloads.mkdir()
+    (downloads / "clip.mp4").write_bytes(b"video")
+    (downloads / "upper.MP4").write_bytes(b"video")
+    (downloads / "node_modules" / "pkg").mkdir(parents=True)
+    (downloads / "node_modules" / "pkg" / "vendor.mp4").write_bytes(b"video")
+    (tmp_workspace / "elsewhere.mp4").write_bytes(b"video")
+    (downloads / ".ssh").mkdir()
+    (downloads / ".ssh" / "secret.mp4").write_bytes(b"private")
+    monkeypatch.setattr("jarvis.pipeline.route", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("extension search should bypass the LLM router")))
+    monkeypatch.setattr("jarvis.llm.call", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("extension search should not require LLM synthesis")))
+
+    result = plan_path("can you find mp4 files in downloads?", ctx=ctx)
+
+    assert result.outcome == "found"
+    assert result.verified and result.deterministic
+    assert "Found 3 .mp4 files" in result.text
+    assert "Denied private locations are excluded." in result.text
+    assert str(downloads / "clip.mp4") in result.text
+    assert str(downloads / "upper.MP4") in result.text
+    assert str(downloads / "node_modules" / "pkg" / "vendor.mp4") in result.text
+    assert "elsewhere.mp4" not in result.text
+    assert "secret.mp4" not in result.text
+
+
+def test_mp4_search_returns_system_scope_matches(ctx, tmp_workspace, monkeypatch):
+    from jarvis.pipeline import plan_path
+
+    (tmp_workspace / "clip.mp4").write_bytes(b"video")
+    monkeypatch.setattr("jarvis.pipeline.route", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("extension search should bypass the LLM router")))
+    monkeypatch.setattr("jarvis.llm.call", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("extension search should not require LLM synthesis")))
+
+    result = plan_path("can you find mp4 files?", ctx=ctx)
+
+    assert result.outcome == "found"
+    assert result.verified and result.deterministic
+    assert "Found 1 .mp4 file" in result.text
+    assert str(tmp_workspace / "clip.mp4") in result.text
+
+
 def test_an_admission_is_not_an_answer():
     from jarvis.pipeline import admits_failure
 

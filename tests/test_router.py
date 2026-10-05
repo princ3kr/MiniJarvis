@@ -251,3 +251,11 @@ def test_bare_filename_recogniser_matches_extensionless_names():
 def test_category_words_map_words_to_survey_categories():
     assert CATEGORY_WORDS["image"] == "image"
     assert CATEGORY_WORDS["files"] is None      # "files" must not narrow the survey
+
+
+def test_extension_query_recognizes_plain_and_dotted_extensions():
+    from jarvis.router import extract_extension_query
+
+    assert extract_extension_query("can you find mp4 files?") == ".mp4"
+    assert extract_extension_query("find *.MP4 files in Downloads") == ".mp4"
+    assert extract_extension_query("is the mp4 codec installed?") is None

@@ -36,7 +36,7 @@ from typing import Any, Literal
 
 from . import llm
 from .context import BudgetExhausted, TaskContext
-from .router import ESCALATION, is_simple_count_query, route
+from .router import ESCALATION, extract_extension_query, is_simple_count_query, route
 from .trace import Verdict
 
 __all__ = ["StageResult", "Outcome", "run_task", "plan_path"]
@@ -147,6 +147,24 @@ def _direct_stage(query: str, *, ctx: TaskContext, use_llm_verify: bool) -> Stag
     intent = extract_intent(query)
     result = run_agent(query, ctx=ctx, root=ctx.root)
     tried = [f"{s.get('by', 'tool')}: {s.get('query', '')}" for s in result.get("searches", [])]
+    if result.get("route") == "extension_search":
+        if result.get("status") != "ok":
+            return StageResult(outcome="error", strategy="direct",
+                               reason=result.get("summary", "extension search incomplete"),
+                               tried=tried, cost={"seconds": round(time.perf_counter() - t0, 2)})
+        survey = result["survey"]
+        paths = survey["sample"]
+        output = (f"root={survey['root']}\nextension={result['extension']}\n"
+                  f"count={survey['matched_count']}\ncomplete={survey['complete']}\n"
+                  + "\n".join(paths))
+        return StageResult(
+            outcome="found", text=result["summary"], strategy="direct",
+            evidence=[{"command": ["survey", survey["root"], result["extension"]],
+                       "output": output}],
+            reason="complete deterministic extension search", tried=tried,
+            verified=True, deterministic=True,
+            cost={"tool_calls": ctx.counters.tool_calls,
+                  "seconds": round(time.perf_counter() - t0, 2)})
     if result.get("route") == "aggregate":
         if result.get("status") != "ok":
             return StageResult(outcome="error", strategy="direct",
@@ -387,9 +405,11 @@ def plan_path(query: str, *, ctx: TaskContext, strategy: str = "auto",
     visits: dict[str, int] = {}
 
     if strategy == "auto":
-        if is_simple_count_query(query):
+        if is_simple_count_query(query) or extract_extension_query(query):
             strategy = "direct"
-            emit("route", "direct — deterministic filesystem count")
+            reason = ("deterministic extension search" if extract_extension_query(query)
+                      else "deterministic filesystem count")
+            emit("route", f"direct — {reason}")
         else:
             r = route(query, ctx=ctx)
             emit("route", f"{r.strategy} — {r.reason}"

@@ -65,14 +65,16 @@ def survey_files(*, ctx: TaskContext, root: Path | str | None = None,
         dur = (time.perf_counter() - t0) * 1000
         return Observation(tool="survey", status="blocked", reason=str(e), duration_ms=dur)
 
-    cats_list = ([categories] if isinstance(categories, str) else list(categories or CATEGORIES.keys()))
-    wanted: set[str] = set()
-    for c in cats_list:
-        wanted |= CATEGORIES.get(c, set())
-    if extensions:
-        wanted |= {e.lower() if e.startswith(".") else f".{e.lower()}" for e in extensions}
     selected_categories = ([categories] if isinstance(categories, str)
                            else list(categories or []))
+    cats_list = selected_categories or list(CATEGORIES.keys())
+    extension_filter = {
+        e.lower() if e.startswith(".") else f".{e.lower()}" for e in (extensions or [])
+    }
+    wanted: set[str] = set()
+    for c in selected_categories or ([] if extension_filter else cats_list):
+        wanted |= CATEGORIES.get(c, set())
+    wanted |= extension_filter
     if count_only and len(selected_categories) > 1:
         count_only = False
     count_extensions = (wanted if count_only and (selected_categories or extensions)
