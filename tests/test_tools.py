@@ -53,6 +53,15 @@ def test_find_iname_before_print(ctx, tmp_workspace):
     assert any("MainFile.txt" in str(p) for p in paths)
 
 
+def test_find_matches_case_and_punctuation_variants(ctx, tmp_workspace):
+    target = tmp_workspace / "Ask-My-Repo-mainV2.zip"
+    target.write_text("ok")
+    obs = find.find_files("Ask-My-Repo-mainV2,zip", ctx=ctx, root=tmp_workspace)
+    assert obs.status == "ok", obs.reason
+    paths = [i["path"] for i in obs.items]
+    assert any(str(target) == str(p) for p in paths)
+
+
 def test_grep_denied_not_read_even_with_r(ctx, tmp_workspace):
     # .ssh/id_rsa should not be returned even if content matches
     obs = grep.search_content("fake", ctx=ctx, root=tmp_workspace)
@@ -97,6 +106,22 @@ def test_survey_respects_skip_and_deny(ctx, tmp_workspace):
     sample = obs.meta.get("sample", [])
     for s in sample:
         assert "node_modules" not in s
+
+
+def test_survey_counts_distinct_files_and_image_category(ctx, tmp_workspace):
+    (tmp_workspace / "one.png").write_bytes(b"image")
+    (tmp_workspace / "two.JPG").write_bytes(b"image")
+    (tmp_workspace / "sheet.xlsx").write_bytes(b"sheet")
+
+    all_files = survey.survey_files(ctx=ctx, root=tmp_workspace)
+    images = survey.survey_files(ctx=ctx, root=tmp_workspace, categories="image")
+
+    assert all_files.status == "ok"
+    assert all_files.meta["files_seen"] == 13
+    assert all_files.meta["matched_count"] == 12
+    assert sum(all_files.meta["by_category"].values()) == 13
+    assert images.meta["by_category"]["image"] == 2
+    assert images.meta["matched_count"] == 2
 
 
 def test_read_observation_valid(ctx, tmp_workspace):

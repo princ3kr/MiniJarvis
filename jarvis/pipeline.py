@@ -36,7 +36,7 @@ from typing import Any, Literal
 
 from . import llm
 from .context import BudgetExhausted, TaskContext
-from .router import ESCALATION, route
+from .router import ESCALATION, is_simple_count_query, route
 from .trace import Verdict
 
 __all__ = ["StageResult", "Outcome", "run_task", "plan_path"]
@@ -66,6 +66,7 @@ class StageResult:
     reason: str = ""
     tried: list[str] = field(default_factory=list)
     verified: bool = False
+    deterministic: bool = False
     cost: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -146,6 +147,34 @@ def _direct_stage(query: str, *, ctx: TaskContext, use_llm_verify: bool) -> Stag
     intent = extract_intent(query)
     result = run_agent(query, ctx=ctx, root=ctx.root)
     tried = [f"{s.get('by', 'tool')}: {s.get('query', '')}" for s in result.get("searches", [])]
+    if result.get("route") == "aggregate":
+        if result.get("status") != "ok":
+            return StageResult(outcome="error", strategy="direct",
+                               reason=result.get("summary", "filesystem survey incomplete"),
+                               tried=tried, cost={"seconds": round(time.perf_counter() - t0, 2)})
+        survey = result["survey"]
+        categories = result["intent"].get("query_type", {}).get("categories", [])
+        count = survey["matched_count"] if categories else survey["files_seen"]
+        if len(categories) == 1:
+            label = f"{categories[0]} file" + ("" if count == 1 else "s")
+        elif categories:
+            label = f"files matching {', '.join(categories)} categories"
+        else:
+            label = "file" + ("" if count == 1 else "s")
+        scope = survey["root"]
+        verb = "is" if count == 1 else "are"
+        answer = (f"There {verb} {count:,} {label} under {scope}. "
+                  "The count includes performance-skipped directories; denied paths are excluded.")
+        evidence_text = (f"root={scope}\ncount={count}\n"
+                         f"files_seen={survey['files_seen']}\n"
+                         f"categories={survey['by_category']}\ncomplete={survey['complete']}")
+        return StageResult(
+            outcome="found", text=answer, strategy="direct",
+            evidence=[{"command": ["survey", scope], "output": evidence_text}],
+            reason="complete deterministic filesystem survey", tried=tried,
+            verified=True, deterministic=True,
+            cost={"tool_calls": ctx.counters.tool_calls,
+                  "seconds": round(time.perf_counter() - t0, 2)})
     # `agents.run_agent` does not label hits as exact or fuzzy; it returns paths and a
     # score. So exactness is computed HERE, from the intent the router extracted,
     # rather than read off a field that does not exist. The first version read
@@ -358,10 +387,14 @@ def plan_path(query: str, *, ctx: TaskContext, strategy: str = "auto",
     visits: dict[str, int] = {}
 
     if strategy == "auto":
-        r = route(query, ctx=ctx)
-        emit("route", f"{r.strategy} — {r.reason}"
-                      + ("  [fallback]" if r.source == "fallback" else ""))
-        strategy = r.strategy
+        if is_simple_count_query(query):
+            strategy = "direct"
+            emit("route", "direct — deterministic filesystem count")
+        else:
+            r = route(query, ctx=ctx)
+            emit("route", f"{r.strategy} — {r.reason}"
+                          + ("  [fallback]" if r.source == "fallback" else ""))
+            strategy = r.strategy
 
     current = strategy
     last: StageResult | None = None
@@ -413,6 +446,9 @@ def plan_path(query: str, *, ctx: TaskContext, strategy: str = "auto",
         # The plan's order: VERIFY (code first) THEN SYNTHESIZE, and only verified
         # text reaches the user. A `found` from a stage is a CANDIDATE, not an answer.
         if res.outcome == "found":
+            if res.deterministic:
+                emit("verify", "verified — complete deterministic filesystem survey")
+                return res
             # The plan's order: VERIFY, then SYNTHESIZE from verified evidence only.
             # A stage can succeed by finding the right thing without having phrased it
             # -- `direct` returns paths, not prose -- so synthesis runs even when the

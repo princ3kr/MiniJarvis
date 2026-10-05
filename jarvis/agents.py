@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,8 @@ from typing import Any
 from .access import AccessDenied, AccessPolicy
 from .context import TaskContext
 from .planner import AgentResult
-from .router import AGENT_NAME_LITERAL, detect_query_type, extract_intent
+from .router import (AGENT_NAME_LITERAL, detect_query_type, extract_intent,
+                     is_simple_count_query)
 from .tools import TOOL_MANIFEST
 from .tools import find as _find_tool
 from .tools.observation import Observation
@@ -199,6 +201,28 @@ def _describe_dir(d: Path | str, *, ctx: TaskContext,
             "excerpt": "\n".join(lines)}
 
 
+def _aggregate_root(query: str, root: Path | str | None, *, ctx: TaskContext) -> Path:
+    """Use a uniquely named immediate child as the scope for aggregate queries."""
+    policy = AccessPolicy.from_settings(ctx.settings, cwd=ctx.root or Path.cwd())
+    base = policy.resolve(root or ctx.root or ctx.settings.read_roots[0])
+    low = query.lower()
+    if re.search(r"\b(system|machine|computer|everywhere|whole\s+system)\b", low):
+        return base
+
+    normalized_query = re.sub(r"[^a-z0-9]+", "", low)
+    candidates: list[Path] = []
+    try:
+        for child in base.iterdir():
+            if not child.is_dir() or not policy.nameable(child):
+                continue
+            normalized_name = re.sub(r"[^a-z0-9]+", "", child.name.lower())
+            if normalized_name and normalized_name in normalized_query:
+                candidates.append(policy.resolve(child))
+    except OSError:
+        return base
+    return candidates[0] if len(candidates) == 1 else base
+
+
 # --------------------------------------------------------------------------- the agent
 def run_agent(user_query: str, *, ctx: TaskContext, top_files: int = 3,
               root: Path | str | None = None,
@@ -224,18 +248,26 @@ def run_agent(user_query: str, *, ctx: TaskContext, top_files: int = 3,
     # ---- aggregate: "how many images are there?"
     if qtype["aggregate"]:
         cats = qtype["categories"]
-        sv = call_tool("survey", ctx=ctx, root=root, categories=cats or None)
+        survey_root = _aggregate_root(user_query, root, ctx=ctx)
+        sv = call_tool("survey", ctx=ctx, root=survey_root, categories=cats or None,
+                       include_skipped_dirs=True,
+                       count_only=is_simple_count_query(user_query))
         rec = ctx.trace.event("agent", "run_agent", detail=user_query[:60], status="ok",
                               t0=t_start, shape="aggregate", cats=cats, tool="agent")
-        ok = bool(cats) or bool(intent["filenames"])
-        return {"status": "ok", "query": user_query, "intent": intent,
+        ok = sv.status == "ok" and bool(sv.meta.get("complete", True))
+        if not ok:
+            summary = f"Survey incomplete: {sv.reason or sv.status}."
+        elif cats:
+            summary = f"Counted {sv.meta['matched_count']} matching files under {survey_root}."
+        else:
+            summary = f"Counted {sv.meta['files_seen']} files under {survey_root}."
+        return {"status": "ok" if ok else "error", "query": user_query, "intent": intent,
                 "route": "aggregate", "near_misses": [],
-                "searches": [{"by": "survey", "categories": cats}],
+                "searches": [{"by": "survey", "categories": cats,
+                              "root": str(survey_root)}],
                 "survey": sv.meta, "evidence": [], "similar_files": [],
-                "summary": (f"Surveyed {sv.meta['files_seen']} files; "
-                            f"{sv.meta['matched_count']} in {cats}." if ok else
-                            f"Surveyed {sv.meta['files_seen']} files, no category recognised."),
-                "confidence": 0.85 if ok else 0.4, "elapsed_ms": rec.duration_ms}
+                "summary": summary,
+                "confidence": 1.0 if ok else 0.0, "elapsed_ms": rec.duration_ms}
 
     ranked: list[dict[str, Any]] = []
     seen_paths: set[str] = set()
@@ -350,8 +382,7 @@ def run_search_files(instruction: str, context: dict[int, Any], *,
         sv = res["survey"]
         return AgentResult(
             status="ok",
-            summary=f"{sv['matched_count']} file(s) in {sv['by_category']} "
-                    f"(of {sv['files_seen']} surveyed; excludes {len(sv['excluded_dirs'])} dirs)",
+            summary=res["summary"],
             evidence=[{"path": s, "kind": "sample"} for s in sv["sample"][:8]],
             confidence=res["confidence"],
             meta={"route": "aggregate", "counts": sv["by_category"],

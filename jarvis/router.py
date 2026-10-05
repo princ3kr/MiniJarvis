@@ -251,6 +251,21 @@ def detect_query_type(query: str) -> dict[str, Any]:
             "cue_hit": next((c for c in AGGREGATE_CUES if c in q), None)}
 
 
+def is_simple_count_query(query: str) -> bool:
+    """Whether the request can be answered by one deterministic file count."""
+    qtype = detect_query_type(query)
+    count = re.search(r"\b(?:how\s+many|count|number\s+of|total|tally)\b", query, re.I)
+    file_kind = re.search(
+        r"\b(?:files?|images?|pictures?|photos?|screenshots?|icons?|videos?|audio|"
+        r"music|songs?|documents?|docs?|pdfs?|spreadsheets?|csv|notebooks?|archives?|"
+        r"zips?|code|scripts?|binaries|executables?)\b", query, re.I)
+    conditional = re.search(
+        r"\b(?:larger|smaller|bigger|over|above|below|older|newer|recent|since|"
+        r"before|after|more\s+than|less\s+than|at\s+least|at\s+most|size|sized)\b|[<>]=?",
+        query, re.I)
+    return bool(count and file_kind and not conditional and qtype["aggregate"])
+
+
 # --------------------------------------------------------------------------- intent
 # Must cover archives and documents: when `zip` was missing,
 # "what is inside Ask-My-Repo-mainV2.zip?" captured no filename at all.
@@ -263,7 +278,10 @@ FILENAME_EXTS = (
     "|pdf|docx?|xlsx?|pptx?|epub|rtf|odt|ods"
     "|png|jpe?g|gif|webp|bmp|tiff?|svg|ico|mp4|mov|avi|mkv|webm|mp3|wav|flac"
 )
-FILENAME_RE = re.compile(r"[\w\-./~]*[\w\-]+\.(?:" + FILENAME_EXTS + r")\b", re.I)
+FILENAME_RE = re.compile(
+    r"[\w\-./~,]*[\w\-]+(?:[.,](?:" + FILENAME_EXTS + r"))\b",
+    re.I,
+)
 BARE_FILENAME_RE = re.compile(
     r"\b(?:Dockerfile|Makefile|README|LICENSE|requirements|Procfile)\b", re.I)
 
@@ -313,4 +331,4 @@ def extract_intent(query: str) -> dict[str, Any]:
 __all__ = ["route", "Route", "STRATEGIES", "ESCALATION", "JUDGE_PROMPT",
            "AGENT_NAME_LITERAL", "CATEGORY_WORDS", "AGGREGATE_CUES",
            "FILENAME_EXTS", "FILENAME_RE", "BARE_FILENAME_RE", "STOPWORDS",
-           "detect_query_type", "extract_intent"]
+           "detect_query_type", "is_simple_count_query", "extract_intent"]

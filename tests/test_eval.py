@@ -186,6 +186,46 @@ def test_a_file_count_claim_is_checked_against_the_listing():
     assert _count_claim_mismatch("The evidence lists 23 files, not 12.", evidence) == ["23"]
 
 
+def test_image_count_uses_deterministic_survey_without_llm(ctx, tmp_workspace, monkeypatch):
+    from jarvis.pipeline import plan_path
+
+    (tmp_workspace / "image.png").write_bytes(b"image")
+    (tmp_workspace / "image.JPG").write_bytes(b"image")
+    monkeypatch.setattr("jarvis.pipeline.route", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("count query should bypass the LLM router")))
+    monkeypatch.setattr("jarvis.llm.call", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("deterministic count should not require an LLM call")))
+
+    result = plan_path("how many image files are there in the system?", ctx=ctx)
+
+    assert result.outcome == "found"
+    assert result.verified and result.deterministic
+    assert "There are 2 image files" in result.text
+
+
+def test_total_file_count_scopes_to_named_downloads(ctx, tmp_workspace, monkeypatch):
+    from jarvis.pipeline import plan_path
+
+    downloads = tmp_workspace / "Downloads"
+    (downloads / "node_modules" / "pkg").mkdir(parents=True)
+    (downloads / "photo.png").write_bytes(b"image")
+    (downloads / "notes.txt").write_text("notes")
+    (downloads / "node_modules" / "pkg" / "ignored.png").write_bytes(b"ignored")
+    (downloads / ".ssh").mkdir()
+    (downloads / ".ssh" / "private.png").write_bytes(b"private")
+    monkeypatch.setattr("jarvis.pipeline.route", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("count query should bypass the LLM router")))
+    monkeypatch.setattr("jarvis.llm.call", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("deterministic count should not require an LLM call")))
+
+    result = plan_path("how many files are there in Downloads?", ctx=ctx)
+
+    assert result.outcome == "found"
+    assert result.verified and result.deterministic
+    assert "There are 3 files" in result.text
+    assert str(downloads) in result.text
+
+
 def test_an_admission_is_not_an_answer():
     from jarvis.pipeline import admits_failure
 

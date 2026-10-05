@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import fnmatch
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,40 @@ from .observation import Observation
 
 def _stem(name: str) -> str:
     return Path(name).stem.lower()
+
+
+def _normalized_tokens(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _pattern_variants(pattern: str) -> list[str]:
+    """Generate conservative filename variants for punctuation/case mismatches.
+
+    This catches common user transcription errors like `ask-my-repo-mainV2,zip`
+    versus the real file `Ask-My-Repo-mainV2.zip` without broadening to unrelated
+    names.
+    """
+    variants: list[str] = []
+    seen: set[str] = set()
+    for candidate in (
+        pattern,
+        pattern.lower(),
+        pattern.replace(",", "."),
+        pattern.replace(".", ","),
+        pattern.replace("_", "-"),
+        pattern.replace("-", "_"),
+        pattern.replace("-", ""),
+        pattern.replace("_", ""),
+    ):
+        safe = candidate.strip()
+        if not safe or safe in seen:
+            continue
+        seen.add(safe)
+        variants.append(safe)
+    base = _normalized_tokens(pattern)
+    if base:
+        variants.append(base)
+    return variants
 
 
 def _prune_args(policy: AccessPolicy) -> list[str]:
@@ -38,6 +73,8 @@ def _match_kind(pattern: str, path: Path, settings: Settings) -> tuple[int | Non
     fco = limits.fuzzy_cutoff
     if low == pl:
         return 0, 1.0, "exact"
+    if _normalized_tokens(low) == _normalized_tokens(pl):
+        return 0, 0.99, "normalized"
     if fnmatch.fnmatch(low, pl):
         return 1, 0.95, "glob"
     same_ext = (Path(name).suffix.lower() == Path(pattern).suffix.lower()
@@ -113,6 +150,15 @@ def find_files(pattern: str, *, ctx: TaskContext, root: Path | str | None = None
     absorb(_find_raw(pattern_wild, base, policy, ctx.settings, kind="f"), False)
     if include_dirs:
         absorb(_find_raw(pattern_wild, base, policy, ctx.settings, kind="d"), True)
+
+    if not best:
+        for variant in _pattern_variants(pattern):
+            variant_wild = variant if any(ch in variant for ch in "*?[") else f"*{variant}*"
+            absorb(_find_raw(variant_wild, base, policy, ctx.settings, kind="f"), False)
+            if include_dirs:
+                absorb(_find_raw(variant_wild, base, policy, ctx.settings, kind="d"), True)
+            if len(best) >= max_res:
+                break
 
     if fuzzy and len(best) < max_res:
         ext = Path(pattern).suffix

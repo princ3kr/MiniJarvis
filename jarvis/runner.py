@@ -55,7 +55,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import Limits
 from .redaction import redact, scrubbed_env
@@ -91,6 +91,8 @@ class ProcessResult:
     truncated: bool = False
     redacted: int = 0
     reason: str = ""
+    streamed_records: int = 0
+    stdout_line_count: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -156,7 +158,10 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 
 def run_process(argv: list[str], *, cwd: Path, timeout_s: int,
                 max_output_bytes: int, limits: Limits,
-                expect_exit: int = 0) -> ProcessResult:
+                expect_exit: int = 0,
+                stdout_record_callback: Callable[[bytes], None] | None = None,
+                stdout_record_separator: bytes = b"\n",
+                count_stdout_lines: bool = False) -> ProcessResult:
     """Run `argv` under full hygiene and return a status. Never raises.
 
     `expect_exit` only affects `status`: an exit code other than it is
@@ -195,7 +200,9 @@ def run_process(argv: list[str], *, cwd: Path, timeout_s: int,
     except OSError as e:
         return _fail(argv, f"{type(e).__name__}: {e}", t0)
 
-    out_b, err_b, truncated, timed_out = _drain_bounded(proc, cap, timeout_s)
+    out_b, err_b, truncated, timed_out, streamed_records, stdout_line_count = _drain_bounded(
+        proc, cap, timeout_s, stdout_record_callback, stdout_record_separator,
+        count_stdout_lines)
 
     # Reap. After a group kill the direct child is gone too, but `wait` is still
     # required to avoid a zombie.
@@ -228,7 +235,8 @@ def run_process(argv: list[str], *, cwd: Path, timeout_s: int,
     return ProcessResult(status=status, exit_code=exit_code, duration_ms=dt,
                          stdout=stdout, stderr=stderr, timed_out=timed_out,
                          command=argv, truncated=truncated, redacted=n1 + n2,
-                         reason=reason)
+                         reason=reason, streamed_records=streamed_records,
+                         stdout_line_count=stdout_line_count if count_stdout_lines else None)
 
 
 def _cap_tail(text: str, cap: int) -> str:
@@ -243,7 +251,11 @@ def _cap_tail(text: str, cap: int) -> str:
 
 
 def _drain_bounded(proc: subprocess.Popen, cap: int,
-                   timeout_s: float) -> tuple[bytes, bytes, bool, bool]:
+                   timeout_s: float,
+                   stdout_record_callback: Callable[[bytes], None] | None = None,
+                   stdout_record_separator: bytes = b"\n",
+                   count_stdout_lines: bool = False
+                   ) -> tuple[bytes, bytes, bool, bool, int, int]:
     """Read both pipes until EOF, the byte cap, or the deadline.
 
     Returns (stdout_bytes, stderr_bytes, truncated, timed_out).
@@ -278,6 +290,9 @@ def _drain_bounded(proc: subprocess.Popen, cap: int,
     # be dropped. Keeping a rolling tail means the cap bounds memory AND keeps the
     # part of the output that carries information.
     tails: dict[str, bytearray] = {"o": bytearray(), "e": bytearray()}
+    pending_record = bytearray()
+    streamed_records = 0
+    stdout_line_count = 0
     # Once the ring is full, how much longer to keep reading before deciding the
     # command is flooding rather than finishing.
     #
@@ -312,6 +327,18 @@ def _drain_bounded(proc: subprocess.Popen, cap: int,
                     open_files -= 1
                     continue
                 _, which = src[fh]
+                if which == "o" and count_stdout_lines:
+                    stdout_line_count += chunk.count(b"\n")
+                if which == "o" and stdout_record_callback is not None:
+                    pending_record.extend(chunk)
+                    while True:
+                        split_at = pending_record.find(stdout_record_separator)
+                        if split_at < 0:
+                            break
+                        record = bytes(pending_record[:split_at])
+                        del pending_record[:split_at + len(stdout_record_separator)]
+                        stdout_record_callback(record)
+                        streamed_records += 1
                 buf = tails[which]
                 buf.extend(chunk)
                 # Keep only the tail. The per-stream share is half the cap so one
@@ -320,7 +347,8 @@ def _drain_bounded(proc: subprocess.Popen, cap: int,
                 if len(buf) > share:
                     del buf[:len(buf) - share]
                     truncated = True
-            if truncated and flood_deadline is None:
+            streaming = stdout_record_callback is not None or count_stdout_lines
+            if truncated and not streaming and flood_deadline is None:
                 # Start the clock ONCE, on the first overflow, and do not extend it
                 # however much more data arrives. Restarting it on each chunk is the
                 # bug this fixes: `yes` produces data forever, so a clock that
@@ -334,7 +362,8 @@ def _drain_bounded(proc: subprocess.Popen, cap: int,
 
     # Either we hit the cap or the command overran: stop it, then take whatever is
     # still buffered in the pipes.
-    if truncated or timed_out:
+    streaming = stdout_record_callback is not None or count_stdout_lines
+    if (truncated and not streaming) or timed_out:
         _kill_tree(proc)
         # Let the tree die before draining, or the read below can block.
         time.sleep(0.05)
@@ -350,6 +379,10 @@ def _drain_bounded(proc: subprocess.Popen, cap: int,
                 if len(buf) > share:
                     del buf[:len(buf) - share]
 
+    if stdout_record_callback is not None and pending_record:
+        stdout_record_callback(bytes(pending_record))
+        streamed_records += 1
+
     for fh in (proc.stdout, proc.stderr):
         try:
             fh.close()
@@ -358,8 +391,8 @@ def _drain_bounded(proc: subprocess.Popen, cap: int,
 
     # `status == "timeout"` is reserved for the deadline. Hitting the byte cap is
     # its own outcome: the command may well have exited 0 with a lot to say.
-    return (bytes(tails["o"]), bytes(tails["e"]), truncated,
-            timed_out and not truncated)
+        return (bytes(tails["o"]), bytes(tails["e"]), truncated,
+                timed_out and not truncated, streamed_records, stdout_line_count)
 
 
 def _fail(argv: list[str], reason: str, t0: float) -> ProcessResult:

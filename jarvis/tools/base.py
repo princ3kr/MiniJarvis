@@ -24,13 +24,17 @@ runner still applies scrubbed env, rlimits, process-group kill, and the output c
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from ..runner import ProcessResult, run_process
 
 
 def run_tool(argv: list[str], *, cwd: Path, timeout_s: int,
              max_output_bytes: int | None = None,
-             limits=None) -> ProcessResult:
+             limits=None,
+             stdout_record_callback: Callable[[bytes], None] | None = None,
+             stdout_record_separator: bytes = b"\n",
+             count_stdout_lines: bool = False) -> ProcessResult:
     """Run a read-only tool command with the runner's guarantees.
 
     Returns a `ProcessResult` and never raises: a tool that cannot start is an
@@ -49,6 +53,9 @@ def run_tool(argv: list[str], *, cwd: Path, timeout_s: int,
         timeout_s=timeout_s,
         max_output_bytes=max_output_bytes or lim.exec_max_output_bytes,
         limits=lim,
+        stdout_record_callback=stdout_record_callback,
+        stdout_record_separator=stdout_record_separator,
+        count_stdout_lines=count_stdout_lines,
         # Tools report their own status; a non-zero exit is meaningful (grep's "no
         # match" is 1) and must NOT be conflated with a runner failure. So the
         # expected exit is 0 here and any other code is surfaced as `nonzero_exit`,

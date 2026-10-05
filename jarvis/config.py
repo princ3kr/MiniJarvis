@@ -218,6 +218,7 @@ class Limits:
     max_results: int = 20
     # subprocess
     timeout_s: int = 15
+    survey_timeout_s: int = 120
     # runner
     exec_timeout_s: int = 60
     exec_max_output_bytes: int = 20_000

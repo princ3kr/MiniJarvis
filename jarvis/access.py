@@ -31,6 +31,7 @@ tool, every command operand, and the metadata index.
 from __future__ import annotations
 
 import fnmatch
+from functools import lru_cache
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,6 +48,7 @@ class AccessDenied(PermissionError):
         self.reason = reason
 
 
+@lru_cache(maxsize=32)
 def _deny_patterns(patterns: tuple[str, ...]) -> tuple[tuple[str, bool, str], ...]:
     """Expand `~` once, note which patterns carry a separator, and record the
     directory a `dir/*` pattern is guarding.
@@ -240,7 +242,7 @@ class AccessPolicy:
             return False, str(e)
 
     # ------------------------------------------------------------------ scope
-    def walkable(self, path: Path) -> bool:
+    def walkable(self, path: Path, *, include_skipped: bool = False) -> bool:
         """May a recursive walk DESCEND into this directory?
 
         Deliberately separate from `resolve`. A path can be perfectly readable and
@@ -254,7 +256,7 @@ class AccessPolicy:
         ~/.cache hold real user files the agent should be able to see; SKIP_DIRS
         already names the ones that are noise.
         """
-        if path.name in self.skip_dirs:
+        if not include_skipped and path.name in self.skip_dirs:
             return False
         if path.name in SECRET_DIRS:
             return False

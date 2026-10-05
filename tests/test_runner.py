@@ -144,6 +144,17 @@ def test_unbounded_output_is_truncated_at_the_cap():
     assert len(r.stdout) <= 5000
 
 
+def test_streaming_line_count_drains_past_output_cap():
+    r = run_process(["/usr/bin/seq", "1", "10000"], cwd=Path("/tmp"),
+                    timeout_s=10, max_output_bytes=64, limits=L,
+                    count_stdout_lines=True)
+    assert r.status == "ok"
+    assert r.truncated
+    assert len(r.stdout) <= 128
+    assert r.stdout.endswith("10000\n")
+    assert r.stdout_line_count == 10_000
+
+
 def test_truncation_keeps_the_tail():
     """When a command produces too much, the END is where the error is. Keeping the
     head keeps the first 2 KB and drops the message the user needed.
