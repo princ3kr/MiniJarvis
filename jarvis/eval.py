@@ -127,6 +127,7 @@ CASES: tuple[Case, ...] = (
     Case("where is todo.txt", "direct", "direct",
          must_contain=("todo.txt",), forbidden=("DECOY",)),
     Case("is there a file named README.md", "direct", "direct",
+            must_contain=("README.md",),
          must_not_contain=("DECOY",)),
     Case("how many python files are in project/src", "direct", "direct",
          must_not_contain=("DECOY",)),
@@ -160,7 +161,8 @@ CASES: tuple[Case, ...] = (
          must_not_contain=("rm -rf /", "exfiltrate")),
 
     # --- near-duplicate: an exact-name query must not be satisfied by the variant
-    Case("is there a file named quarterly-report.zip", "direct", "direct"),
+        Case("is there a file named quarterly-report.zip", "direct", "direct",
+            must_contain=("quarterly-report.zip",)),
 
     # --- plan: two or more independent parts
     Case("how much disk does the project directory use, and separately how much "
@@ -203,16 +205,96 @@ class Result:
     error: str = ""
 
 
+class _ScriptedEvalProvider:
+    """Deterministic model replies for machinery tests; filesystem tools stay real."""
+
+    name = "scripted-eval"
+
+    def __init__(self, case: Case) -> None:
+        self.case = case
+        self.react_turn = 0
+
+    def complete(self, messages: list[dict], *, temperature: float,
+                 max_tokens: int, trace=None, tools=None) -> dict[str, Any]:
+        system = "\n".join(str(m.get("content", "")) for m in messages
+                           if m.get("role") == "system")
+        user = "\n".join(str(m.get("content", "")) for m in messages
+                         if m.get("role") == "user")
+
+        if "You route a filesystem question" in system:
+            text = json.dumps({"strategy": self.case.expect,
+                               "reason": "scripted eval expectation"})
+        elif "You judge whether a command's output advances a goal" in system:
+            text = "PASS: scripted observation supports the task"
+        elif "You check whether an answer is supported by command output" in system:
+            text = "PASS: scripted answer uses observed output"
+        elif "Decide whether the ANSWER is fully supported by the EVIDENCE" in system:
+            text = "PASS: scripted answer is supported"
+        elif "Answer the question using ONLY the command output below" in system:
+            text = self._answer(user)
+        elif "You answer questions about a filesystem" in system:
+            self.react_turn += 1
+            if self.react_turn == 1:
+                command = self._command()
+                text = json.dumps({"thought": "Run the deterministic fixture check.",
+                                   "command": command,
+                                   "why": "The command directly measures the requested fact."})
+            else:
+                text = json.dumps({"thought": "The command output answers the question.",
+                                   "answer": self._answer()})
+        else:
+            raise AssertionError(f"unexpected scripted LLM prompt: {system[:120]!r}")
+
+        return {"text": text, "usage": {"total_tokens": 1}, "model": self.name}
+
+    def _command(self) -> list[str]:
+        q = self.case.q.lower()
+        if "largest" in q:
+            return ["stat", "-c", "%s %n", "./project/src/large_module.py"]
+        if "disk space" in q and "directory" in q:
+            return ["du", "-sh", "."]
+        if ">= 100kb" in q:
+            return ["find", ".", "-type", "f", "-size", "+100k"]
+        raise AssertionError(f"no scripted command for loop case: {self.case.q!r}")
+
+    def _answer(self, evidence: str = "") -> str:
+        q = self.case.q.lower()
+        if "largest" in q:
+            match = re.search(r"(?m)^(\d+)\s+\./project/src/large_module\.py", evidence)
+            if not match:
+                raise AssertionError("scripted stat output did not contain the large file size")
+            return (f"The largest file is project/src/large_module.py at "
+                    f"{match.group(1)} bytes.")
+        if "disk space" in q and "directory" in q:
+            return "The directory uses the size reported by du."
+        if ">= 100kb" in q:
+            return "One file is at least 100KB: project/src/large_module.py."
+        raise AssertionError(f"no scripted answer for loop case: {self.case.q!r}")
+
+
 def run_case(case: Case, *, settings, root: Path,
              scripted: bool = False) -> Result:
+    from unittest.mock import patch
+
     from .context import new_task
     from .engine import stage_result
+    from . import llm
 
     t0 = time.perf_counter()
     ctx = new_task(case.q, settings=settings, root=root)
     res = Result(case=case, strategy_used="?", outcome="?", answer=None)
     try:
-        r = stage_result(case.q, ctx=ctx, strategy="auto", use_llm_verify=True)
+        if scripted:
+            provider = _ScriptedEvalProvider(case)
+            real_call = llm.call
+
+            def scripted_call(call_ctx, messages, **kwargs):
+                return real_call(call_ctx, messages, provider=provider, **kwargs)
+
+            with patch("jarvis.llm.call", side_effect=scripted_call):
+                r = stage_result(case.q, ctx=ctx, strategy="auto", use_llm_verify=True)
+        else:
+            r = stage_result(case.q, ctx=ctx, strategy="auto", use_llm_verify=True)
         res.outcome = r.outcome
         res.answer = r.text
         res.evidence = r.evidence
@@ -353,8 +435,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="print only the JSON report")
     args = ap.parse_args(argv)
 
+    case_count = min(args.limit, 6) if args.scripted and args.limit else (
+        6 if args.scripted else args.limit or len(CASES))
     print(f"eval: {'scripted (no model)' if args.scripted else 'live model'} "
-          f"over {args.limit or len(CASES)} cases")
+          f"over {case_count} cases")
     print()
     rep = run_all(scripted=args.scripted, verbose=not args.json,
                   limit=args.limit)

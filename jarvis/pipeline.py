@@ -261,10 +261,16 @@ def _loop_stage(query: str, *, ctx: TaskContext, use_llm_verify: bool,
     t0 = time.perf_counter()
     r = run_react(query, ctx=ctx, max_turns=max_turns, use_llm_verify=use_llm_verify)
     tried = [f"{s.action}: {' '.join(s.args.get('argv', []))[:70]}" for s in r.steps]
+    evidence = [
+        {"command": s.args.get("argv", []), "output": s.observation.text}
+        for s in r.steps
+        if s.verdict is Verdict.pass_ and s.observation is not None
+        and s.observation.status == "ok" and s.observation.text
+    ]
 
     if r.status == "answered" and r.answer:
         return StageResult(
-            outcome="found", text=r.answer, strategy="loop",
+            outcome="found", text=r.answer, strategy="loop", evidence=evidence,
             reason=f"answered after {r.turns} turn(s)", tried=tried,
             verified=(r.status == "answered"),
             cost={"turns": r.turns, "llm_calls": ctx.counters.llm_calls,
@@ -280,7 +286,7 @@ def _loop_stage(query: str, *, ctx: TaskContext, use_llm_verify: bool,
                            cost={"turns": r.turns})
 
     if r.status == "budget":
-        return StageResult(outcome="error", strategy="loop",
+        return StageResult(outcome="not_found", strategy="loop",
                            reason=f"budget exhausted after {r.turns} turn(s)",
                            tried=tried)
 
@@ -409,6 +415,8 @@ def plan_path(query: str, *, ctx: TaskContext, strategy: str = "auto",
             strategy = "direct"
             reason = ("deterministic extension search" if extract_extension_query(query)
                       else "deterministic filesystem count")
+            ctx.log("route", "judge", detail=f"direct ({reason})", status="ok",
+                    strategy="direct", reason=reason, source="fast_path", tool="router")
             emit("route", f"direct — {reason}")
         else:
             r = route(query, ctx=ctx)
@@ -449,7 +457,8 @@ def plan_path(query: str, *, ctx: TaskContext, strategy: str = "auto",
             else:
                 raise ValueError(f"unknown strategy {current!r}")
         except BudgetExhausted as e:
-            res = StageResult(outcome="error", strategy=current, reason=str(e))
+            res = StageResult(outcome="not_found", strategy=current,
+                              reason=f"budget exhausted: {e}")
         except Exception as e:
             # CONTRACT rule 5: never raise across a stage boundary. An exception that
             # escapes here kills the task and loses the trace that explains it.
@@ -462,6 +471,9 @@ def plan_path(query: str, *, ctx: TaskContext, strategy: str = "auto",
         stage_results.append(res)
         emit("stage", f"{current} -> {res.outcome}"
                       + (f" ({res.reason})" if res.reason else ""))
+
+        if res.outcome == "not_found" and "budget exhausted" in res.reason.lower():
+            return res
 
         # The plan's order: VERIFY (code first) THEN SYNTHESIZE, and only verified
         # text reaches the user. A `found` from a stage is a CANDIDATE, not an answer.
@@ -596,7 +608,7 @@ def synthesize_verified(query: str, candidate: str, evidence: list[dict],
         return None, f"answer states {', '.join(bad)} files but the evidence lists a different number"
 
     # --- code first: numbers
-    bad = _unsupported_numbers(candidate, corpus)
+    bad = _unsupported_numbers(candidate, corpus, query=query)
     if bad:
         return None, f"answer states {', '.join(bad)} which no command output contains"
 

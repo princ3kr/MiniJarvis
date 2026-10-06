@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -168,6 +169,80 @@ def test_truncation_keeps_the_tail():
             "i=$((i+1)); done; echo THE_ERROR_AT_THE_END"], t=10, cap=3000)
     assert r.truncated
     assert "THE_ERROR_AT_THE_END" in r.stdout
+
+
+def test_both_stdout_and_stderr_are_drained_before_return():
+    """The drain loop must finish both pipes before returning. Returning after the
+    first stream close drops the second stream and makes a command appear to have
+    said less than it did.
+    """
+    r = run_process(["/bin/sh", "-c", "echo STDOUT; echo STDERR >&2"],
+                    cwd=Path("/tmp"), timeout_s=10, max_output_bytes=20_000,
+                    limits=L)
+    assert r.status == "ok"
+    assert "STDOUT" in r.stdout
+    assert "STDERR" in r.stderr
+
+
+def test_drain_reads_every_stream_before_return(monkeypatch):
+    """The bounded-drain helper must walk every pipe before returning. Returning
+    after the first stream is closed drops the remainder of the second stream, which
+    is the same bug as a one-sided timeout path.
+    """
+    import jarvis.runner as runner_mod
+
+    class FakeFile:
+        def __init__(self, name, chunks):
+            self.name = name
+            self.chunks = list(chunks)
+            self.closed = False
+
+        def fileno(self):
+            return 1 if self.name == "o" else 2
+
+        def read(self, n):
+            if not self.chunks:
+                return b""
+            return self.chunks.pop(0)
+
+        def close(self):
+            self.closed = True
+
+    class FakeSelector:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def register(self, fh, event):
+            pass
+
+        def unregister(self, fh):
+            pass
+
+        def close(self):
+            pass
+
+        def select(self, timeout=None):
+            if self.stream is None:
+                return []
+            out = self.stream
+            self.stream = None
+            return [(SimpleNamespace(fileobj=out), None)]
+
+    stdout = FakeFile("o", [b"x" * 4096])
+    stderr = FakeFile("e", [b"ERR\n"])
+    proc = SimpleNamespace(stdout=stdout, stderr=stderr, pid=123)
+
+    monkeypatch.setattr(runner_mod.selectors, "DefaultSelector",
+                        lambda: FakeSelector(stdout))
+    monkeypatch.setattr(runner_mod, "_kill_tree", lambda proc: None)
+
+    out, err, truncated, timed_out, _, _ = runner_mod._drain_bounded(
+        proc, cap=1024, timeout_s=1, count_stdout_lines=False
+    )
+
+    assert truncated is True
+    assert b"ERR\n" in err
+    assert out.startswith(b"x")
 
 
 def test_output_cap_stops_the_command_instead_of_waiting_for_the_timeout():

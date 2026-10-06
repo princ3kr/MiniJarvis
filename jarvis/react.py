@@ -123,7 +123,7 @@ Reply with ONE JSON object: run a command, or finish."""
 _NUM = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s*([KMGTP]i?B?|bytes?)?", re.I)
 
 
-def _unsupported_numbers(answer: str, evidence: str) -> list[str]:
+def _unsupported_numbers(answer: str, evidence: str, *, query: str = "") -> list[str]:
     """Numbers in the answer that appear nowhere in the evidence.
 
     The specific way this agent lies. Asked how much disk a directory used, it ran
@@ -144,12 +144,19 @@ def _unsupported_numbers(answer: str, evidence: str) -> list[str]:
     if not answer:
         return []
     ev = evidence.replace(",", "")
+    query_quantities = {
+        (m.group(1).rstrip("0").rstrip("."),
+         (m.group(2) or "").lower().rstrip("b"))
+        for m in _NUM.finditer(query)
+    }
     bad: list[str] = []
     for m in _NUM.finditer(answer):
         value, unit = m.group(1), (m.group(2) or "").lower().rstrip("b")
         # A bare small integer is usually conversational ("the 3 files I saw"),
         # not a measurement. Checking those produces noise.
         if not unit and "." not in value and len(value) <= 2:
+            continue
+        if (value.rstrip("0").rstrip("."), unit) in query_quantities:
             continue
         if _present_in(value, ev):
             continue
@@ -528,7 +535,7 @@ class ReactLoop:
         if not self.use_llm_verify:
             return Verdict.unsure, "verification skipped"
 
-        unsupported = _unsupported_numbers(answer, evidence_text)
+        unsupported = _unsupported_numbers(answer, evidence_text, query=self._goal)
         try:
             out = self._call(self.ctx, [
                 {"role": "system", "content":

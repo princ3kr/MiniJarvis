@@ -252,7 +252,12 @@ def detect_query_type(query: str) -> dict[str, Any]:
 
 
 def is_simple_count_query(query: str) -> bool:
-    """Whether the request can be answered by one deterministic file count."""
+    """Whether the request can be answered by one deterministic file count.
+
+    If the same request also asks for the actual locations/paths/addresses of the
+    matches, a simple count is not enough and the agent must return the file list as
+    evidence instead of suppressing it behind a bare total.
+    """
     qtype = detect_query_type(query)
     count = re.search(r"\b(?:how\s+many|count|number\s+of|total|tally)\b", query, re.I)
     file_kind = re.search(
@@ -263,7 +268,14 @@ def is_simple_count_query(query: str) -> bool:
         r"\b(?:larger|smaller|bigger|over|above|below|older|newer|recent|since|"
         r"before|after|more\s+than|less\s+than|at\s+least|at\s+most|size|sized)\b|[<>]=?",
         query, re.I)
-    return bool(count and file_kind and not conditional and qtype["aggregate"])
+    path_request = re.search(
+        r"\b(?:address|addresses|path|paths|location|locations|where|which\s+ones|"
+        r"show\s+(?:me\s+)?(?:each|all|the)|list\s+(?:me\s+)?(?:each|all|the)|"
+        r"give\s+me\s+(?:the\s+)?(?:path|paths|addresses|locations)|"
+        r"each\s+of\s+them|all\s+of\s+them)\b",
+        query, re.I,
+    )
+    return bool(count and file_kind and not conditional and not path_request and qtype["aggregate"])
 
 
 # --------------------------------------------------------------------------- intent
@@ -290,6 +302,10 @@ def extract_extension_query(query: str) -> str | None:
     """Return a recognized extension explicitly requested as a file type."""
     from .config import CATEGORIES
 
+    # An extension embedded in an explicitly named file belongs to that filename
+    # lookup, not to a search for every file of that type.
+    if FILENAME_RE.search(query):
+        return None
     known = {extension.lstrip(".").lower()
              for extensions in CATEGORIES.values() for extension in extensions}
     matches = re.findall(
@@ -298,6 +314,8 @@ def extract_extension_query(query: str) -> str | None:
         query, re.I)
     for dotted, bare in matches:
         extension = (dotted or bare).lower()
+        if bare and extension in {"a", "an", "i", "is", "in", "it", "to", "of"}:
+            continue
         if extension in known:
             return f".{extension}"
     return None

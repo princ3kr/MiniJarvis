@@ -391,8 +391,8 @@ def _drain_bounded(proc: subprocess.Popen, cap: int,
 
     # `status == "timeout"` is reserved for the deadline. Hitting the byte cap is
     # its own outcome: the command may well have exited 0 with a lot to say.
-        return (bytes(tails["o"]), bytes(tails["e"]), truncated,
-                timed_out and not truncated, streamed_records, stdout_line_count)
+    return (bytes(tails["o"]), bytes(tails["e"]), truncated,
+            timed_out and not truncated, streamed_records, stdout_line_count)
 
 
 def _fail(argv: list[str], reason: str, t0: float) -> ProcessResult:

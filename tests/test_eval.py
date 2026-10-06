@@ -176,6 +176,14 @@ def test_a_confabulated_number_is_rejected():
 
     assert _unsupported_numbers("total 376 blocks", "total 376\n") == []
     assert _unsupported_numbers("approximately 37K", "total 376\n") == ["37k"]
+    assert _unsupported_numbers(
+        "The only file >= 100MB is large.py.", "large.py 104857600 bytes",
+        query="which file is >= 100MB?",
+    ) == []
+    assert _unsupported_numbers(
+        "The file is about 120 MiB.", "large.py 104857600 bytes",
+        query="which file is >= 100MB?",
+    ) == ["120mi"]
 
 
 def test_a_file_count_claim_is_checked_against_the_listing():
@@ -184,6 +192,58 @@ def test_a_file_count_claim_is_checked_against_the_listing():
     evidence = "a.txt\nb.txt\nc.txt\n"
     assert _count_claim_mismatch("There are 3 files in the folder.", evidence) == []
     assert _count_claim_mismatch("The evidence lists 23 files, not 12.", evidence) == ["23"]
+
+
+def test_loop_stage_preserves_verified_command_evidence(monkeypatch, ctx):
+    from jarvis.pipeline import _loop_stage
+    from jarvis.react import ReactResult, Step
+    from jarvis.tools.observation import Observation
+    from jarvis.trace import Verdict
+
+    step = Step(1, "inspect", "run_command", {"argv": ["du", "-sh", "."]},
+                Observation(tool="run_command", status="ok", text="120M\t."),
+                Verdict.pass_, "command output supports goal")
+    monkeypatch.setattr("jarvis.react.run_react", lambda *args, **kwargs:
+                        ReactResult("The directory uses 120M.", "answered", [step]))
+
+    result = _loop_stage("how much disk is used?", ctx=ctx, use_llm_verify=False)
+
+    assert result.outcome == "found"
+    assert result.evidence == [{"command": ["du", "-sh", "."], "output": "120M\t."}]
+
+
+def test_loop_budget_exhaustion_is_not_found_with_tried_steps(monkeypatch, ctx):
+    from jarvis.pipeline import _loop_stage
+    from jarvis.react import ReactResult, Step
+
+    step = Step(1, "inspect", "run_command", {"argv": ["ls", "-la"]})
+    monkeypatch.setattr("jarvis.react.run_react", lambda *args, **kwargs:
+                        ReactResult(None, "budget", [step]))
+
+    result = _loop_stage("find a file", ctx=ctx, use_llm_verify=False)
+
+    assert result.outcome == "not_found"
+    assert "budget exhausted" in result.reason
+    assert result.tried == ["run_command: ls -la"]
+
+
+def test_pipeline_budget_exception_returns_not_found_with_prior_tried_list(monkeypatch, ctx):
+    from jarvis.context import BudgetExhausted
+    from jarvis.pipeline import StageResult, plan_path
+
+    monkeypatch.setattr("jarvis.pipeline._direct_stage", lambda *args, **kwargs:
+                        StageResult(outcome="near_miss", strategy="direct",
+                                    tried=["find: target"]))
+
+    def exhaust(*args, **kwargs):
+        raise BudgetExhausted("iteration ceiling reached")
+
+    monkeypatch.setattr("jarvis.pipeline._loop_stage", exhaust)
+    result = plan_path("locate target", ctx=ctx, strategy="direct")
+
+    assert result.outcome == "not_found"
+    assert "budget exhausted" in result.reason
+    assert result.tried == ["find: target"]
 
 
 def test_image_count_uses_deterministic_survey_without_llm(ctx, tmp_workspace, monkeypatch):
@@ -271,6 +331,22 @@ def test_mp4_search_returns_system_scope_matches(ctx, tmp_workspace, monkeypatch
     assert result.verified and result.deterministic
     assert "Found 1 .mp4 file" in result.text
     assert str(tmp_workspace / "clip.mp4") in result.text
+
+
+def test_scripted_exact_name_eval_enforces_expected_names(settings, tmp_workspace):
+    from jarvis.eval import CASES, run_case
+
+    readme = tmp_workspace / "README.md"
+    readme.write_text("# fixture\n")
+    docs = tmp_workspace / "docs"
+    docs.mkdir(exist_ok=True)
+    (docs / "quarterly-report.zip").write_bytes(b"zip")
+    (docs / "quarterly-report-2023.zip").write_bytes(b"zip")
+
+    for index in (1, 9):
+        result = run_case(CASES[index], settings=settings, root=tmp_workspace,
+                          scripted=True)
+        assert result.ok, (CASES[index].q, result.answer, result.missing, result.reason)
 
 
 def test_an_admission_is_not_an_answer():

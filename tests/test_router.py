@@ -219,6 +219,13 @@ def test_query_shape(query, shape):
     assert detect_query_type(query)["shape"] == shape
 
 
+def test_count_queries_that_request_paths_are_not_simple_counts():
+    assert R.is_simple_count_query("how many mp4 files are there?") is True
+    assert R.is_simple_count_query(
+        "how many mp4 files are there? and also give me the addresses of each of them"
+    ) is False
+
+
 def test_aggregate_query_recognises_its_category():
     assert "image" in detect_query_type("how many images are there?")["categories"]
 
@@ -259,3 +266,5 @@ def test_extension_query_recognizes_plain_and_dotted_extensions():
     assert extract_extension_query("can you find mp4 files?") == ".mp4"
     assert extract_extension_query("find *.MP4 files in Downloads") == ".mp4"
     assert extract_extension_query("is the mp4 codec installed?") is None
+    assert extract_extension_query("is there a file named zzz-missing.txt") is None
+    assert extract_extension_query("is there a file named README.md") is None
